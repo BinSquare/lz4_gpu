@@ -31,9 +31,7 @@ pub enum LZ4Error {
     UnsupportedFrame(String),
 }
 
-const LZ4_MAX_MATCH_LENGTH: usize = 0xFFFF + 4;
 const LZ4_MIN_MATCH: usize = 4;
-const LZ4_MAX_OFFSET: usize = 0xFFFF;
 
 pub struct LZ4Decompressor;
 
@@ -55,8 +53,10 @@ impl LZ4Decompressor {
     }
 
     fn decompress_sequential(&self, frame: &LZ4CompressedFrame) -> Result<Vec<u8>> {
+        // Pre-allocate output buffer once
         let mut output = vec![0u8; frame.uncompressed_size];
 
+        // Process blocks sequentially with direct buffer access
         for block in &frame.blocks {
             let block_input = &frame.payload[block.compressed_offset as usize..]
                 [..block.compressed_size as usize];
@@ -66,6 +66,7 @@ impl LZ4Decompressor {
             if block.is_compressed {
                 self.decompress_block(block_input, block_output)?;
             } else {
+                // Direct copy for uncompressed blocks
                 block_output.copy_from_slice(block_input);
             }
         }
@@ -88,8 +89,9 @@ impl LZ4Decompressor {
             .num_threads(concurrency)
             .build_global();
 
-        // Process blocks in parallel and collect results
-        let block_results: Result<Vec<(usize, Vec<u8>)>, anyhow::Error> = frame
+        // Process blocks in parallel and collect individual results
+        // This avoids the borrowing issue by creating separate output buffers
+        let block_results: Result<Vec<(usize, Vec<u8>)>, _> = frame
             .blocks
             .par_iter()
             .enumerate()
@@ -99,13 +101,15 @@ impl LZ4Decompressor {
 
                 let block_output = if block.is_compressed {
                     let mut output = vec![0u8; block.uncompressed_size as usize];
-                    self.decompress_block(block_input, &mut output)?;
+                    self.decompress_block(block_input, &mut output)
+                        .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))?;
                     output
                 } else {
+                    // Direct copy for uncompressed blocks
                     block_input.to_vec()
                 };
 
-                Ok((block_idx, block_output))
+                Ok::<(usize, Vec<u8>), anyhow::Error>((block_idx, block_output))
             })
             .collect();
 
@@ -123,100 +127,240 @@ impl LZ4Decompressor {
         Ok(output)
     }
 
+    #[inline(always)]
     fn decompress_block(&self, input: &[u8], output: &mut [u8]) -> Result<()> {
         let mut src = 0;
         let mut dst = 0;
         let input_len = input.len();
         let output_len = output.len();
 
-        while src < input_len {
-            let token = input[src];
-            src += 1;
+        // Pre-validate that we have enough space in both buffers
+        if input_len == 0 || output_len == 0 {
+            return Ok(());
+        }
 
-            // Decode literal length
-            let mut literal_length = (token >> 4) as usize;
-            if literal_length == 15 {
-                literal_length += self.read_length(&input[src..])?;
-                src += self.length_bytes(literal_length - 15);
+        // Prefetch the beginning of input and output for better cache performance
+        // Using standard Rust prefetch hints when available
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                input.as_ptr() as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+            std::arch::x86_64::_mm_prefetch(
+                output.as_ptr() as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+
+        while src < input_len && dst < output_len {
+            // Fast path: Unrolled literal and match processing
+            if src + 5 <= input_len && dst + 16 <= output_len {
+                let token = input[src];
+                src += 1;
+
+                // Process literals with fast path optimization
+                let literal_length_nibble = (token >> 4) as usize;
+                if literal_length_nibble < 15 {
+                    // Fast path for short literals
+                    let literal_end = src + literal_length_nibble;
+                    if literal_end <= input_len {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                input.as_ptr().add(src),
+                                output.as_mut_ptr().add(dst),
+                                literal_length_nibble,
+                            );
+                        }
+                        src = literal_end;
+                        dst += literal_length_nibble;
+                    } else {
+                        return Err(LZ4Error::MalformedStream.into());
+                    }
+                } else {
+                    // Extended literal length
+                    let mut literal_length = literal_length_nibble;
+                    while src < input_len {
+                        let byte = input[src];
+                        src += 1;
+                        literal_length += byte as usize;
+                        if byte != 255 {
+                            break;
+                        }
+                    }
+
+                    // Bounds check for extended literals
+                    if src + literal_length > input_len || dst + literal_length > output_len {
+                        return Err(LZ4Error::MalformedStream.into());
+                    }
+
+                    // Fast copy for extended literals
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            input.as_ptr().add(src),
+                            output.as_mut_ptr().add(dst),
+                            literal_length,
+                        );
+                    }
+                    src += literal_length;
+                    dst += literal_length;
+                }
+
+                // Early exit if we're at end of input
+                if src >= input_len {
+                    break;
+                }
+
+                // Process matches with fast path optimization
+                if src + 2 <= input_len {
+                    let offset = input[src] as usize | ((input[src + 1] as usize) << 8);
+                    src += 2;
+
+                    // Validate offset early
+                    if offset == 0 || dst < offset {
+                        return Err(LZ4Error::MalformedStream.into());
+                    }
+
+                    // Process match length with fast path
+                    let match_length_nibble = (token & 0x0F) as usize;
+                    let mut match_length = match_length_nibble + LZ4_MIN_MATCH;
+                    if match_length_nibble == 15 {
+                        // Extended match length
+                        while src < input_len {
+                            let byte = input[src];
+                            src += 1;
+                            match_length += byte as usize;
+                            if byte != 255 {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Bounds check for match
+                    if dst + match_length > output_len {
+                        return Err(LZ4Error::OutputOverflow.into());
+                    }
+
+                    // Fast match copy with overlap handling
+                    let match_src = dst - offset;
+                    self.copy_match_overlap(output, match_src, dst, match_length);
+                    dst += match_length;
+                } else {
+                    return Err(LZ4Error::MalformedStream.into());
+                }
+            } else {
+                // Slow path for edge cases (near buffer boundaries)
+                if src >= input_len {
+                    break;
+                }
+
+                let token = input[src];
+                src += 1;
+
+                // Decode literal length (high nibble) - simplified
+                let mut literal_length = (token >> 4) as usize;
+                if literal_length == 15 {
+                    while src < input_len {
+                        let byte = input[src];
+                        src += 1;
+                        literal_length += byte as usize;
+                        if byte != 255 {
+                            break;
+                        }
+                    }
+                }
+
+                // Copy literals with bounds checking
+                if literal_length > 0 {
+                    if src + literal_length > input_len || dst + literal_length > output_len {
+                        return Err(LZ4Error::MalformedStream.into());
+                    }
+                    output[dst..dst + literal_length]
+                        .copy_from_slice(&input[src..src + literal_length]);
+                    src += literal_length;
+                    dst += literal_length;
+                }
+
+                // Early exit
+                if src >= input_len {
+                    break;
+                }
+
+                // Decode match - simplified
+                if src + 2 > input_len {
+                    return Err(LZ4Error::MalformedStream.into());
+                }
+
+                let offset = input[src] as usize | ((input[src + 1] as usize) << 8);
+                src += 2;
+
+                // Validate offset
+                if offset == 0 || dst < offset {
+                    return Err(LZ4Error::MalformedStream.into());
+                }
+
+                // Decode match length (low nibble) - simplified
+                let mut match_length = ((token & 0x0F) as usize) + LZ4_MIN_MATCH;
+                if (token & 0x0F) == 0x0F {
+                    while src < input_len {
+                        let byte = input[src];
+                        src += 1;
+                        match_length += byte as usize;
+                        if byte != 255 {
+                            break;
+                        }
+                    }
+                }
+
+                // Check output bounds
+                if dst + match_length > output_len {
+                    return Err(LZ4Error::OutputOverflow.into());
+                }
+
+                // Copy match with overlap handling
+                let match_src = dst - offset;
+                self.copy_match_overlap(output, match_src, dst, match_length);
+                dst += match_length;
             }
-
-            // Copy literals
-            if src + literal_length > input_len {
-                return Err(LZ4Error::MalformedStream.into());
-            }
-            if dst + literal_length > output_len {
-                return Err(LZ4Error::OutputOverflow.into());
-            }
-
-            output[dst..dst + literal_length].copy_from_slice(&input[src..src + literal_length]);
-            src += literal_length;
-            dst += literal_length;
-
-            if src >= input_len {
-                break;
-            }
-
-            // Decode match
-            if src + 2 > input_len {
-                return Err(LZ4Error::MalformedStream.into());
-            }
-
-            let offset = input[src] as usize | ((input[src + 1] as usize) << 8);
-            src += 2;
-
-            if offset == 0 || offset > dst {
-                return Err(LZ4Error::MalformedStream.into());
-            }
-
-            let mut match_length = ((token & 0x0F) as usize) + LZ4_MIN_MATCH;
-            if (token & 0x0F) == 0x0F {
-                match_length += self.read_length(&input[src..])?;
-                src += self.length_bytes(match_length - LZ4_MIN_MATCH - 15);
-            }
-
-            if dst + match_length > output_len {
-                return Err(LZ4Error::OutputOverflow.into());
-            }
-
-            // Copy match - use temporary buffer to avoid borrowing issues
-            let src_start = dst - offset;
-            let temp = output[src_start..src_start + match_length].to_vec();
-            output[dst..dst + match_length].copy_from_slice(&temp);
-            dst += match_length;
         }
 
         Ok(())
     }
 
-    fn read_length(&self, input: &[u8]) -> Result<usize> {
+    /// Copy match data handling overlap efficiently
+    fn copy_match_overlap(&self, output: &mut [u8], src: usize, dst: usize, length: usize) {
+        // Only use non-overlapping copy when it is actually non-overlapping.
+        // LZ4 matches often overlap (self-referential), so we must be careful.
+        if src + length <= dst {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    output.as_ptr().add(src),
+                    output.as_mut_ptr().add(dst),
+                    length,
+                );
+            }
+        } else {
+            // Overlap case - byte-by-byte copy to handle self-reference correctly
+            for i in 0..length {
+                output[dst + i] = output[src + i];
+            }
+        }
+    }
+
+    fn read_length_with_count(&self, input: &[u8]) -> Result<(usize, usize)> {
         let mut length = 0;
         let mut i = 0;
 
         while i < input.len() {
             let value = input[i] as usize;
-            i += 1;
             length += value;
+            i += 1;
             if value != 255 {
                 break;
             }
         }
 
-        Ok(length)
-    }
-
-    fn length_bytes(&self, length: usize) -> usize {
-        let mut bytes = 0;
-        let mut remaining = length;
-
-        while remaining >= 255 {
-            bytes += 1;
-            remaining -= 255;
-        }
-        if remaining > 0 {
-            bytes += 1;
-        }
-
-        bytes
+        Ok((length, i))
     }
 
     pub fn measure_decompressed_size(input: &[u8]) -> Result<usize> {
@@ -282,204 +426,5 @@ impl LZ4Decompressor {
         }
 
         Ok(produced)
-    }
-
-    pub fn compress(&self, data: &[u8], block_size: usize) -> Result<LZ4CompressedFrame> {
-        let mut blocks = Vec::new();
-        let mut payload = Vec::new();
-        payload.reserve(data.len() / 2);
-
-        let mut input_offset = 0;
-        let mut output_offset = 0;
-
-        while input_offset < data.len() {
-            let chunk_size = block_size.min(data.len() - input_offset);
-            let chunk = &data[input_offset..input_offset + chunk_size];
-            let compressed = self.compress_block(chunk)?;
-
-            blocks.push(LZ4BlockDescriptor {
-                compressed_size: compressed.len() as u32,
-                uncompressed_size: chunk_size as u32,
-                compressed_offset: payload.len() as u32,
-                output_offset: output_offset as u32,
-                is_compressed: true,
-            });
-
-            payload.extend_from_slice(&compressed);
-            input_offset += chunk_size;
-            output_offset += chunk_size;
-        }
-
-        let total_compressed_bytes = payload.len();
-        Ok(LZ4CompressedFrame {
-            uncompressed_size: data.len(),
-            block_size,
-            blocks,
-            payload: Arc::from(payload),
-            total_compressed_bytes,
-            reported_content_size: Some(data.len()),
-            uses_block_checksum: false,
-        })
-    }
-
-    fn compress_block(&self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        output.reserve(input.len() / 2);
-
-        let hash_size = 1 << 16;
-        let mut hash_table = vec![-1i32; hash_size];
-
-        let mut anchor = 0;
-        let mut index = 0;
-        let match_limit = input.len().saturating_sub(LZ4_MIN_MATCH);
-
-        while index <= match_limit {
-            if index + LZ4_MIN_MATCH > input.len() {
-                break;
-            }
-
-            let seq = self.read_u32_at(input, index);
-            let h = ((seq.wrapping_mul(2654435761)) >> (32 - 16)) as usize;
-            let candidate = hash_table[h] as usize;
-            hash_table[h] = index as i32;
-
-            if candidate != usize::MAX
-                && index.saturating_sub(candidate) <= LZ4_MAX_OFFSET
-                && self.read_u32_at(input, candidate) == seq
-            {
-                let mut match_index = candidate + LZ4_MIN_MATCH;
-                let mut current_index = index + LZ4_MIN_MATCH;
-
-                while current_index < input.len()
-                    && match_index < input.len()
-                    && input[current_index] == input[match_index]
-                {
-                    current_index += 1;
-                    match_index += 1;
-                }
-
-                let literal_length = index - anchor;
-                let mut token = (literal_length.min(15) as u8) << 4;
-                let match_length = current_index - index;
-                let match_run = match_length.saturating_sub(LZ4_MIN_MATCH);
-
-                if match_run < 15 {
-                    token |= match_run as u8;
-                } else {
-                    token |= 0x0F;
-                }
-
-                output.push(token);
-
-                // Write literal length
-                if literal_length >= 15 {
-                    self.write_length(&mut output, literal_length - 15)?;
-                }
-
-                // Write literals
-                output.extend_from_slice(&input[anchor..index]);
-
-                // Write match offset
-                let offset = index - candidate;
-                output.push(offset as u8);
-                output.push((offset >> 8) as u8);
-
-                // Write match length
-                if match_run >= 15 {
-                    self.write_length(&mut output, match_run - 15)?;
-                }
-
-                anchor = current_index;
-                index = current_index;
-            } else {
-                index += 1;
-            }
-        }
-
-        // Handle remaining literals
-        if anchor < input.len() {
-            let literal_length = input.len() - anchor;
-            let token = (literal_length.min(15) as u8) << 4;
-            output.push(token);
-
-            if literal_length >= 15 {
-                self.write_length(&mut output, literal_length - 15)?;
-            }
-
-            output.extend_from_slice(&input[anchor..]);
-        }
-
-        Ok(output)
-    }
-
-    fn read_u32_at(&self, data: &[u8], offset: usize) -> u32 {
-        if offset + 4 <= data.len() {
-            u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ])
-        } else {
-            let mut bytes = [0u8; 4];
-            let copy_len = (data.len() - offset).min(4);
-            bytes[..copy_len].copy_from_slice(&data[offset..offset + copy_len]);
-            u32::from_le_bytes(bytes)
-        }
-    }
-
-    fn write_length(&self, output: &mut Vec<u8>, mut length: usize) -> Result<()> {
-        while length >= 255 {
-            output.push(255);
-            length -= 255;
-        }
-        if length > 0 {
-            output.push(length as u8);
-        }
-        Ok(())
-    }
-
-    pub fn compress_to_frame(&self, data: &[u8], block_size: usize) -> Result<Vec<u8>> {
-        let frame = self.compress(data, block_size)?;
-
-        let mut output = Vec::new();
-
-        // LZ4 Frame Magic Number
-        output.extend_from_slice(&[0x04, 0x22, 0x4D, 0x18]);
-
-        // Frame Descriptor
-        let mut descriptor = 0x40u8; // Version 01, Block Independence
-        if frame.uses_block_checksum {
-            descriptor |= 0x10;
-        }
-        if frame.reported_content_size.is_some() {
-            descriptor |= 0x08;
-        }
-        output.push(descriptor);
-
-        // Content Size (if present)
-        if let Some(content_size) = frame.reported_content_size {
-            output.extend_from_slice(&content_size.to_le_bytes());
-        }
-
-        // Blocks
-        for block in &frame.blocks {
-            let block_size = if block.is_compressed {
-                block.compressed_size
-            } else {
-                block.uncompressed_size | 0x80000000
-            };
-
-            output.extend_from_slice(&block_size.to_le_bytes());
-            output.extend_from_slice(
-                &frame.payload[block.compressed_offset as usize..]
-                    [..block.compressed_size as usize],
-            );
-        }
-
-        // End Mark
-        output.extend_from_slice(&[0, 0, 0, 0]);
-
-        Ok(output)
     }
 }

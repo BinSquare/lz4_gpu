@@ -1,5 +1,6 @@
-use anyhow::{Result, Context};
-use crate::lz4::{LZ4CompressedFrame, LZ4BlockDescriptor, LZ4Error};
+use crate::direct_io::CrossPlatformIO;
+use crate::lz4::{LZ4BlockDescriptor, LZ4CompressedFrame, LZ4Error};
+use anyhow::{Context, Result};
 
 const FRAME_MAGIC: u32 = 0x184D2204;
 const SKIPPABLE_MASK: u32 = 0xFFFFFFF0;
@@ -9,9 +10,8 @@ pub struct LZ4FrameParser;
 
 impl LZ4FrameParser {
     pub fn parse_file(path: &str) -> Result<ParsedFrame> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("Failed to read file: {}", path))?;
-        
+        let data = std::fs::read(path).with_context(|| format!("Failed to read file: {}", path))?;
+
         let frame = Self::parse(&data)?;
         let file_size = data.len();
         let file_path = std::path::Path::new(path)
@@ -19,7 +19,35 @@ impl LZ4FrameParser {
             .and_then(|name| name.to_str())
             .unwrap_or("unknown")
             .to_string();
-        
+
+        Ok(ParsedFrame {
+            frame,
+            file_size,
+            file_path,
+        })
+    }
+
+    /// Parse file using direct I/O optimized for unified memory systems
+    /// This approach reduces unnecessary data copies on Apple M-series chips
+    pub fn parse_file_direct_io(path: &str) -> Result<ParsedFrame> {
+        // Use optimized I/O for unified memory systems
+        let data = CrossPlatformIO::read_file_optimized(path)
+            .with_context(|| format!("Failed to read file with direct I/O: {}", path))?;
+
+        // Prepare data for GPU access (no-op on unified memory systems)
+        CrossPlatformIO::prepare_for_gpu(&data)?;
+
+        let frame = Self::parse(&data)?;
+        let file_size = data.len();
+        let file_path = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Hint about access patterns for better performance
+        CrossPlatformIO::hint_gpu_access_pattern(&data)?;
+
         Ok(ParsedFrame {
             frame,
             file_size,
@@ -31,13 +59,18 @@ impl LZ4FrameParser {
         let mut cursor = 0;
 
         let magic = Self::read_u32(data, &mut cursor)?;
-        
+
         if (magic & SKIPPABLE_MASK) == SKIPPABLE_MAGIC {
-            return Err(LZ4Error::UnsupportedFrame("Skippable frames are not supported".to_string()).into());
+            return Err(LZ4Error::UnsupportedFrame(
+                "Skippable frames are not supported".to_string(),
+            )
+            .into());
         }
-        
+
         if magic != FRAME_MAGIC {
-            return Err(LZ4Error::UnsupportedFrame(format!("Unexpected magic {:08X}", magic)).into());
+            return Err(
+                LZ4Error::UnsupportedFrame(format!("Unexpected magic {:08X}", magic)).into(),
+            );
         }
 
         // Read FLG and BD
@@ -46,7 +79,11 @@ impl LZ4FrameParser {
 
         let version = (flg >> 6) & 0x03;
         if version != 1 {
-            return Err(LZ4Error::UnsupportedFrame(format!("Unsupported frame version {}", version)).into());
+            return Err(LZ4Error::UnsupportedFrame(format!(
+                "Unsupported frame version {}",
+                version
+            ))
+            .into());
         }
 
         if (flg & 0x01) != 0 {
@@ -55,7 +92,10 @@ impl LZ4FrameParser {
 
         let block_independence = ((flg >> 5) & 0x01) == 0x01;
         if !block_independence {
-            return Err(LZ4Error::UnsupportedFrame("Dependent blocks are not supported".to_string()).into());
+            return Err(LZ4Error::UnsupportedFrame(
+                "Dependent blocks are not supported".to_string(),
+            )
+            .into());
         }
 
         let block_checksum_flag = ((flg >> 4) & 0x01) == 0x01;
@@ -69,7 +109,13 @@ impl LZ4FrameParser {
             5 => 256 * 1024,
             6 => 1 * 1024 * 1024,
             7 => 4 * 1024 * 1024,
-            _ => return Err(LZ4Error::UnsupportedFrame(format!("Unsupported block size ID {}", block_max_id)).into()),
+            _ => {
+                return Err(LZ4Error::UnsupportedFrame(format!(
+                    "Unsupported block size ID {}",
+                    block_max_id
+                ))
+                .into())
+            }
         };
 
         let reported_content_size = if content_size_flag {
@@ -97,7 +143,7 @@ impl LZ4FrameParser {
 
             let is_compressed = (block_header & 0x80000000) == 0;
             let stored_size = (block_header & 0x7FFFFFFF) as usize;
-            
+
             if cursor + stored_size > data.len() {
                 return Err(LZ4Error::MalformedStream.into());
             }
@@ -143,7 +189,8 @@ impl LZ4FrameParser {
                 return Err(LZ4Error::UnsupportedFrame(format!(
                     "Content size mismatch: header {} vs blocks {}",
                     reported, total_uncompressed
-                )).into());
+                ))
+                .into());
             }
         }
 
