@@ -44,4 +44,3 @@ if decompressor.has_gpu() {
 - `src/gpu.rs` – GPU pipeline and WGSL shader
 - `src/lz4_parser.rs` – LZ4 frame parser
 - `src/main.rs` – CLI entry point
-- `swift_metal_poc/` – legacy Swift/Metal proof-of-concept (not maintained)

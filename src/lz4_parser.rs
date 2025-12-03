@@ -152,7 +152,10 @@ impl LZ4FrameParser {
             let block_data = &data[block_start..block_start + stored_size];
 
             let uncompressed_size = if is_compressed {
-                crate::lz4::LZ4Decompressor::measure_decompressed_size(block_data)?
+                crate::lz4::LZ4Decompressor::measure_decompressed_size(
+                    block_data,
+                    block_size,
+                )?
             } else {
                 stored_size
             };
