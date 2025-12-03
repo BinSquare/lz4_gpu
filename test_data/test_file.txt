@@ -1,0 +1,3 @@
+This is a test file for GPU decompression functionality.
+We'll create a simple text file and then compress it with LZ4.
+Then we can test the GPU decompression implementation.

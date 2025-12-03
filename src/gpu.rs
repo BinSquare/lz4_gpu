@@ -420,8 +420,9 @@ impl GPUDecompressor {
             });
             compute_pass.set_pipeline(&self.device.compute_pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            // Dispatch exactly enough workgroups for @workgroup_size(64)
-            let wg_size: u32 = 64;
+            // Dispatch exactly enough workgroups for @workgroup_size(1)
+            // Using 1 thread per block avoids wasting lanes when block counts are small.
+            let wg_size: u32 = 1;
             let num_groups = ((total_blocks as u32) + (wg_size - 1)) / wg_size;
             compute_pass.dispatch_workgroups(num_groups.max(1), 1, 1);
         } // <- compute pass dropped here
@@ -637,7 +638,9 @@ fn read_length_varint(src: u32, src_end: u32) -> LenRead {
     return LenRead(total, s);
 }
 
-@compute @workgroup_size(64)
+// Workgroup size 1 keeps one invocation per block, ensuring small block counts
+// still fully parallelize instead of wasting lanes in a large workgroup.
+@compute @workgroup_size(1)
 fn lz4_decompress_blocks(@builtin(global_invocation_id) gid : vec3<u32>) {
     let block_id = gid.x;
     if (block_id >= config.block_count) {
