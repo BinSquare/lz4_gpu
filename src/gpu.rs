@@ -2,12 +2,9 @@ use crate::lz4::LZ4CompressedFrame;
 use crate::memory_pool::GPUMemoryPool;
 use crate::persistent_gpu::GPUContextManager;
 use anyhow::{Context, Result};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use wgpu::*;
-
-/// Global GPU device singleton to reduce initialization overhead
-static GLOBAL_GPU_DEVICE: OnceLock<Arc<Mutex<GPUDevice>>> = OnceLock::new();
 
 /// Errors that can occur during GPU operations
 #[derive(Error, Debug)]
@@ -122,7 +119,7 @@ impl GPUDevice {
         let (device, queue) = adapter
             .request_device(
                 &DeviceDescriptor {
-                    label: Some("FilesCanFly GPU Device"),
+                    label: Some("GPU Device"),
                     required_features: Features::empty(),
                     required_limits: limits,
                 },
@@ -274,6 +271,9 @@ impl GPUDecompressor {
             _pad0: 0,
         };
 
+        // Status buffer initialized to zero so unwritten entries are treated as success.
+        let status_init = vec![0u32; total_blocks];
+
         // Convert byte data to u32 array for GPU
         let payload_u32 = Self::bytes_to_u32_array(&frame.payload);
 
@@ -380,6 +380,29 @@ impl GPUDecompressor {
             buffer
         };
 
+        let status_buffer = {
+            let mut pool = self.device.memory_pool.lock().unwrap();
+            let buffer = if let Some(pool_buffer) = pool.get_buffer(
+                (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4),
+                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            ) {
+                pool_buffer
+            } else {
+                pool.allocate_new_buffer(
+                    &*self.device.device,
+                    (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4),
+                    BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+                )
+            };
+
+            // Initialize statuses to zero each dispatch to avoid stale failures.
+            self.device
+                .queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&status_init));
+
+            buffer
+        };
+
         // Bind group (use pipeline's layout to avoid mismatches)
         let bgl0 = self.device.compute_pipeline.get_bind_group_layout(0);
         let bind_group = self.device.device.create_bind_group(&BindGroupDescriptor {
@@ -401,6 +424,10 @@ impl GPUDecompressor {
                 BindGroupEntry {
                     binding: 3,
                     resource: config_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: status_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -441,6 +468,142 @@ impl GPUDecompressor {
 
         // Wait for GPU to finish
         self.device.device.poll(Maintain::Wait);
+
+        // Check per-block statuses before reading output to avoid propagating bad data.
+        let status_readback_size =
+            (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4);
+        let status_staging = {
+            let mut pool = self.device.memory_pool.lock().unwrap();
+            if let Some(pool_buffer) =
+                pool.get_buffer(status_readback_size, BufferUsages::MAP_READ | BufferUsages::COPY_DST)
+            {
+                pool_buffer
+            } else {
+                pool.allocate_new_buffer(
+                    &*self.device.device,
+                    status_readback_size,
+                    BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                )
+            }
+        };
+
+        // Copy statuses to staging for mapping.
+        {
+            let mut status_encoder = self
+                .device
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("Status Readback Encoder"),
+                });
+            status_encoder.copy_buffer_to_buffer(
+                &status_buffer,
+                0,
+                &status_staging,
+                0,
+                status_readback_size,
+            );
+            let status_cb = status_encoder.finish();
+            self.device.queue.submit(std::iter::once(status_cb));
+        }
+
+        let gpu_error = {
+            let status_slice = status_staging.slice(..);
+            let (status_tx, status_rx) = futures_intrusive::channel::shared::oneshot_channel();
+            status_slice.map_async(MapMode::Read, move |res| {
+                let _ = status_tx.send(res);
+            });
+            self.device.device.poll(Maintain::Wait);
+            let _ = status_rx
+                .receive()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Failed to receive status buffer map"))??;
+
+            let status_data = status_slice.get_mapped_range();
+            let mut gpu_error: Option<(usize, u32)> = None;
+            for (idx, chunk) in status_data.chunks(4).enumerate() {
+                let val = u32::from_le_bytes(chunk.try_into().unwrap());
+                if val != 0 {
+                    gpu_error = Some((idx, val));
+                    break;
+                }
+            }
+            drop(status_data);
+            let _ = status_slice;
+            status_staging.unmap();
+            gpu_error
+        };
+
+        if let Some((idx, packed)) = gpu_error {
+            let code = packed & 0xFF;
+            let detail = packed >> 8;
+            // Return buffers to the pool before bailing so we don't leak GPU memory.
+            let mut pool = self.device.memory_pool.lock().unwrap();
+            pool.return_buffer(
+                payload_buffer,
+                ((payload_u32.len() as u64) * (std::mem::size_of::<u32>() as u64)).max(1),
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            );
+            pool.return_buffer(
+                block_info_buffer,
+                ((gpu_blocks.len() as u64) * (std::mem::size_of::<GPUBlockInfo>() as u64)).max(1),
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            );
+            pool.return_buffer(
+                output_buffer,
+                output_size_bytes,
+                BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            );
+            pool.return_buffer(
+                staging_output_buffer,
+                output_size_bytes,
+                BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            );
+            pool.return_buffer(
+                config_buffer,
+                std::mem::size_of::<KernelConfig>() as u64,
+                BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            );
+            pool.return_buffer(
+                status_buffer,
+                (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4),
+                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            );
+            pool.return_buffer(
+                status_staging,
+                status_readback_size,
+                BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            );
+
+            // Provide extra context about the failing block to aid debugging.
+            let block_debug = frame.blocks.get(idx).map(|b| {
+                let start = b.compressed_offset as usize;
+                let end = start.saturating_add(b.compressed_size as usize).min(frame.payload.len());
+                let slice = &frame.payload[start..end];
+                let token = slice.get(0).copied().unwrap_or(0);
+                let off_lo = slice.get(1).copied().unwrap_or(0);
+                let off_hi = slice.get(2).copied().unwrap_or(0);
+                format!(
+                    "compressed_size={}, output_size={}, is_compressed={}, first_token=0x{:02X}, first_offset=0x{:02X}{:02X}",
+                    b.compressed_size,
+                    b.uncompressed_size,
+                    b.is_compressed,
+                    token,
+                    off_hi,
+                    off_lo
+                )
+            });
+
+            return Err(anyhow::anyhow!(
+                "GPU decompression failed for block {} (status code {}, detail {}){}",
+                idx,
+                code,
+                detail,
+                block_debug
+                    .as_ref()
+                    .map(|s| format!(", block={}", s))
+                    .unwrap_or_default()
+            ));
+        }
 
         // Read back from staging buffer
         let buffer_slice = staging_output_buffer.slice(..);
@@ -506,6 +669,11 @@ impl GPUDecompressor {
                 std::mem::size_of::<KernelConfig>() as u64,
                 BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             );
+            pool.return_buffer(
+                status_buffer,
+                (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4),
+                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            );
         }
 
         Ok(bytes)
@@ -560,6 +728,9 @@ var<storage, read_write> output : array<u32>;
 @group(0) @binding(3)
 var<uniform> config : KernelConfig;
 
+@group(0) @binding(4)
+var<storage, read_write> statuses : array<u32>;
+
 // ----- Byte helpers bound to specific buffers -----
 
 fn read_compressed_byte(index: u32) -> u32 {
@@ -610,30 +781,37 @@ fn write_output_byte(index: u32, value: u32) {
     output[word_index] = (prev & mask) | ((value & 0xFFu) << shift);
 }
 
+fn set_error(block: u32, code: u32, detail: u32) {
+    if (block < arrayLength(&statuses)) {
+        // Pack detail in the upper bits for debugging: [detail:24][code:8]
+        statuses[block] = (detail << 8u) | (code & 0xFFu);
+    }
+}
+
 struct LenRead {
     len      : u32,
     next_src : u32,
 };
 
 // Reads a varint length extension - with max iteration safety
-fn read_length_varint(src: u32, src_end: u32) -> LenRead {
+fn read_length_varint(src: u32, src_end: u32, max_len: u32) -> LenRead {
     var s = src;
     var total = 0u;
-    var count = 0u;
-    // Maximum 4 extensions possible in LZ4 format (per spec)
-    let max_extensions = 4u;
     
     loop {
-        if (s >= src_end || count >= max_extensions) {
+        if (s >= src_end) {
             break;
         }
         let v = read_compressed_byte(s);
         s = s + 1u;
         total = total + v;
+        if (total > max_len) {
+            // Stop early; caller will treat oversized length as an error.
+            break;
+        }
         if (v != 255u) {
             break;
         }
-        count = count + 1u;
     }
     return LenRead(total, s);
 }
@@ -653,9 +831,37 @@ fn lz4_decompress_blocks(@builtin(global_invocation_id) gid : vec3<u32>) {
     let dst_start = info.output_offset;
     let dst_end   = dst_start + info.output_size;
 
+    // Initialize status to success for this block (so stale data doesn't leak).
+    set_error(block_id, 0u, 0u);
+
     // Validate block parameters
     if (info.compressed_size == 0u || info.output_size == 0u || src_start >= arrayLength(&compressed) * 4u) {
+        set_error(block_id, 1u, 0u);
         return;
+    }
+
+    if ((src_start + info.compressed_size) > config.compressed_length) {
+        set_error(block_id, 2u, 0u);
+        return;
+    }
+
+    if ((dst_start + info.output_size) > config.output_length) {
+        set_error(block_id, 3u, 0u);
+        return;
+    }
+
+    // Uncompressed blocks must match output size.
+    if (info.is_compressed == 0u && info.compressed_size != info.output_size) {
+        set_error(block_id, 4u, 0u);
+        return;
+    }
+
+    // Clear destination region to avoid stale data when decoding aborts early.
+    var zi = 0u;
+    loop {
+        if (zi >= info.output_size) { break; }
+        write_output_byte(dst_start + zi, 0u);
+        zi = zi + 1u;
     }
 
     // Fast path: uncompressed block (raw copy).
@@ -695,19 +901,24 @@ fn lz4_decompress_blocks(@builtin(global_invocation_id) gid : vec3<u32>) {
         // Decode literal length from upper nibble
         var literal_length = (token >> 4u) & 0x0Fu;
         if (literal_length == 15u) {
-            let len_result = read_length_varint(src, src_end);
+            let len_result = read_length_varint(src, src_end, info.output_size);
             literal_length = literal_length + len_result.len;
             src = len_result.next_src;
         }
 
         // Copy literals
+        if (src + literal_length > src_end) {
+            set_error(block_id, 5u, literal_length);
+            return;
+        }
+        if (dst + literal_length > dst_end) {
+            set_error(block_id, 5u, literal_length);
+            return;
+        }
         var literal_count = 0u;
         loop {
             if (literal_count >= literal_length) { 
                 break; 
-            }
-            if (src >= src_end || dst >= dst_end) {
-                break; // Prevent reading beyond input or writing beyond output
             }
             let literal_byte = read_compressed_byte(src);
             write_output_byte(dst, literal_byte);
@@ -716,14 +927,15 @@ fn lz4_decompress_blocks(@builtin(global_invocation_id) gid : vec3<u32>) {
             literal_count = literal_count + 1u;
         }
 
-        // Check if we've reached the end after literals
-        if (src >= src_end || dst >= dst_end) {
+        // If we've consumed all input after literals, block is complete.
+        if (src >= src_end) {
             break;
         }
 
         // Decode match offset (2 bytes, little-endian)
         if (src + 1u >= src_end) {
-            break; // Need at least 2 bytes for offset
+            set_error(block_id, 5u, 0u); // Need at least 2 bytes for offset
+            return;
         }
         let offset_lo = read_compressed_byte(src);
         let offset_hi = read_compressed_byte(src + 1u);
@@ -731,16 +943,24 @@ fn lz4_decompress_blocks(@builtin(global_invocation_id) gid : vec3<u32>) {
         src = src + 2u;
 
         // Validate offset
-        if (offset == 0u || (dst - dst_start) < offset) {
-            break; // Invalid offset
+        let written = dst - dst_start;
+        if (offset == 0u || offset > written) {
+            // Record where in the compressed stream we hit the bad offset (relative to block start).
+            set_error(block_id, 6u, src - src_start);
+            return; // Invalid offset
         }
 
         // Decode match length from lower nibble + 4
         var match_length = (token & 0x0Fu) + 4u;
         if ((token & 0x0Fu) == 15u) {
-            let len_result = read_length_varint(src, src_end);
+            let len_result = read_length_varint(src, src_end, info.output_size);
             match_length = match_length + len_result.len;
             src = len_result.next_src;
+        }
+
+        if (dst + match_length > dst_end) {
+            set_error(block_id, 5u, match_length);
+            return;
         }
 
         // Copy match bytes (with overlap support)
@@ -754,15 +974,23 @@ fn lz4_decompress_blocks(@builtin(global_invocation_id) gid : vec3<u32>) {
             }
             // Calculate source position for match byte
             let source_pos = dst - offset;
-            if (source_pos >= dst_start && source_pos < dst) {
-                let match_byte = read_output_byte(source_pos);
-                write_output_byte(dst, match_byte);
-                dst = dst + 1u;
-            } else {
-                break; // Invalid source position
+            if (source_pos < dst_start || source_pos >= dst) {
+                // Invalid source position; bail with error.
+                break;
             }
+            let match_byte = read_output_byte(source_pos);
+            write_output_byte(dst, match_byte);
+            dst = dst + 1u;
             match_count = match_count + 1u;
         }
+
+        // If we didn't complete the match copy, mark error.
+        if (match_count < match_length) {
+            set_error(block_id, 6u, src - src_start);
+            return;
+        }
     }
+
+    // Success path: status already zeroed at start.
 }
 "#;

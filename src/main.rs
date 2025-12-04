@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.input_file.is_none() {
-        println!("FilesCanFly Rust - High-performance LZ4 decompression");
+        println!("Lz4_gpu Rust - High-performance LZ4 decompression with GPU support");
         println!("Usage: files-can-fly-rust [OPTIONS] <INPUT_FILE>");
         println!();
         println!("Arguments:");
@@ -116,34 +116,46 @@ async fn main() -> Result<()> {
             let gpu_start = Instant::now();
             let gpu_result = decompressor.decompress_gpu(&parsed.frame).await?;
             let gpu_duration = gpu_start.elapsed();
-
             let size = gpu_result.len();
             println!("GPU result size: {}", size);
             println!("GPU decompression time: {:.2?}", gpu_duration);
 
             // Verify results match
             if cpu_result != gpu_result {
-                eprintln!("⚠️  WARNING: CPU and GPU results don't match!");
+                return Err(anyhow::anyhow!(
+                    "GPU output mismatch (CPU and GPU results differ)"
+                ));
             }
 
-            Some(size)
+            Some((size, gpu_result))
         } else {
             println!("GPU not available for comparison");
             None
         };
 
-        // Return CPU result (or GPU if preferred)
-        cpu_result
+        // Return GPU result when available and matching; otherwise CPU.
+        if let Some((_, gpu_result)) = _gpu_result_size {
+            gpu_result
+        } else {
+            cpu_result
+        }
     } else if args.profile {
         // Run performance profiling
         println!("Profiling decompression performance...");
 
         let result = if !args.disable_gpu && decompressor.has_gpu() {
             let start = Instant::now();
-            let data = decompressor.decompress_gpu(&parsed.frame).await?;
-            let duration = start.elapsed();
-            println!("GPU decompression completed in: {:.2?}", duration);
-            data
+            match decompressor.decompress_gpu(&parsed.frame).await {
+                Ok(data) => {
+                    let duration = start.elapsed();
+                    println!("GPU decompression completed in: {:.2?}", duration);
+                    data
+                }
+                Err(e) => {
+                    eprintln!("⚠️  GPU path failed: {e}");
+                    return Err(e);
+                }
+            }
         } else {
             let concurrency = args.cpu_threads.unwrap_or(num_cpus::get());
             let start = Instant::now();
@@ -158,13 +170,20 @@ async fn main() -> Result<()> {
         // Normal operation
         if !args.disable_gpu && decompressor.has_gpu() {
             let start = Instant::now();
-            let data = decompressor.decompress_gpu(&parsed.frame).await?;
-            let duration = start.elapsed();
-            println!(
-                "GPU decompression completed in: {:.2?}ms",
-                duration.as_millis() as f64
-            );
-            data
+            match decompressor.decompress_gpu(&parsed.frame).await {
+                Ok(data) => {
+                    let duration = start.elapsed();
+                    println!(
+                        "GPU decompression completed in: {:.2?}ms",
+                        duration.as_millis() as f64
+                    );
+                    data
+                }
+                Err(e) => {
+                    eprintln!("⚠️  GPU path failed: {e}");
+                    return Err(e);
+                }
+            }
         } else {
             let concurrency = args.cpu_threads.unwrap_or(num_cpus::get());
             let start = Instant::now();

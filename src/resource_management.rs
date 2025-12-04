@@ -87,21 +87,13 @@ pub struct GPUMemoryPool {
 /// Buffer information for tracking purposes
 #[derive(Debug, Clone)]
 struct BufferInfo {
-    size: u64,
-    usage: BufferUsages,
     created_at: Instant,
-    is_in_use: bool,
 }
 
 impl BufferInfo {
     /// Create a new buffer info entry
-    pub fn new(size: u64, usage: BufferUsages) -> Self {
-        Self {
-            size,
-            usage,
-            created_at: Instant::now(),
-            is_in_use: false,
-        }
+    pub fn new() -> Self {
+        Self { created_at: Instant::now() }
     }
 
     /// Get buffer age
@@ -137,12 +129,12 @@ impl GPUMemoryPool {
     }
 
     /// Record buffer allocation for statistics tracking
-    pub fn record_buffer_allocation(&self, size: u64, usage: BufferUsages) {
+    pub fn record_buffer_allocation(&self, size: u64, _usage: BufferUsages) {
         let mut buffer_sizes = self.buffer_sizes.lock().unwrap();
         let mut stats = self.stats.lock().unwrap();
 
         // Add buffer info for tracking
-        buffer_sizes.push(BufferInfo::new(size, usage));
+        buffer_sizes.push(BufferInfo::new());
 
         // Update stats
         stats.allocation_count += 1;

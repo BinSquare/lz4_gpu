@@ -28,6 +28,8 @@ pub enum LZ4Error {
     MalformedStream,
     #[error("Output overflow")]
     OutputOverflow,
+    #[error("Checksum mismatch: {0}")]
+    ChecksumMismatch(String),
     #[error("Unsupported frame: {0}")]
     UnsupportedFrame(String),
 }
@@ -83,34 +85,37 @@ impl LZ4Decompressor {
         let payload = &frame.payload;
 
         // Set up parallel processing
-        let concurrency = concurrency.unwrap_or_else(|| num_cpus::get());
-        let _ = rayon::ThreadPoolBuilder::new()
+        let concurrency = concurrency.unwrap_or_else(num_cpus::get).max(1);
+        let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency)
-            .build_global();
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build rayon thread pool: {}", e))?;
 
         // Process blocks in parallel and collect individual results
         // This avoids the borrowing issue by creating separate output buffers
-        let block_results: Result<Vec<(usize, Vec<u8>)>, _> = frame
-            .blocks
-            .par_iter()
-            .enumerate()
-            .map(|(block_idx, block)| {
-                let block_input =
-                    &payload[block.compressed_offset as usize..][..block.compressed_size as usize];
+        let block_results: Result<Vec<(usize, Vec<u8>)>, _> = pool.install(|| {
+            frame
+                .blocks
+                .par_iter()
+                .enumerate()
+                .map(|(block_idx, block)| {
+                    let block_input = &payload[block.compressed_offset as usize..]
+                        [..block.compressed_size as usize];
 
-                let block_output = if block.is_compressed {
-                    let mut output = vec![0u8; block.uncompressed_size as usize];
-                    self.decompress_block(block_input, &mut output)
-                        .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))?;
-                    output
-                } else {
-                    // Direct copy for uncompressed blocks
-                    block_input.to_vec()
-                };
+                    let block_output = if block.is_compressed {
+                        let mut output = vec![0u8; block.uncompressed_size as usize];
+                        self.decompress_block(block_input, &mut output)
+                            .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))?;
+                        output
+                    } else {
+                        // Direct copy for uncompressed blocks
+                        block_input.to_vec()
+                    };
 
-                Ok::<(usize, Vec<u8>), anyhow::Error>((block_idx, block_output))
-            })
-            .collect();
+                    Ok::<(usize, Vec<u8>), anyhow::Error>((block_idx, block_output))
+                })
+                .collect()
+        });
 
         let block_results = block_results?;
 

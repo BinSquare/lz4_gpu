@@ -177,7 +177,7 @@ impl StreamingPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Decompressor, LZ4FrameParser};
+    use crate::Decompressor;
 
     #[tokio::test]
     async fn test_streaming_pipeline_creation() -> Result<()> {

@@ -1,6 +1,6 @@
-# FilesCanFly (Rust)
+# lz4_gpu (Rust)
 
-High-performance LZ4 frame decompression with CPU and GPU backends. GPU is built on `wgpu` (Metal/Vulkan/DX12); CPU uses Rayon for block-parallel decode. This project focuses on decompression only.
+Proof of concept work for LZ4 frame decompression with GPU acceleration. GPU is built on `wgpu` (Metal/Vulkan/DX12); CPU uses Rayon for block-parallel decode. This project focuses on decompression only.
 
 ## Features
 - LZ4 frame parsing and validation (independent blocks only)

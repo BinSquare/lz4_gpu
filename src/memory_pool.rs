@@ -12,6 +12,10 @@ pub struct GPUMemoryPool {
     stats: MemoryPoolStats,
 }
 
+// Hard limits to prevent unbounded growth in long-running processes.
+const MAX_POOL_BUFFERS: usize = 32;
+const MAX_POOL_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB of pooled buffers
+
 #[derive(Debug, Default)]
 pub struct MemoryPoolStats {
     pub allocated_count: usize,
@@ -62,6 +66,7 @@ impl GPUMemoryPool {
     pub fn return_buffer(&mut self, buffer: Buffer, size: u64, usage: BufferUsages) {
         let key = BufferKey { size, usage };
         self.pool.entry(key).or_insert_with(Vec::new).push(buffer);
+        self.enforce_limits();
     }
 
     pub fn get_stats(&self) -> &MemoryPoolStats {
@@ -76,14 +81,51 @@ impl GPUMemoryPool {
         // Remove empty lists to save memory
         self.pool.retain(|_, list| !list.is_empty());
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    fn enforce_limits(&mut self) {
+        loop {
+            let (buffer_count, total_bytes) = self.current_usage();
+            if buffer_count <= MAX_POOL_BUFFERS && total_bytes <= MAX_POOL_BYTES {
+                break;
+            }
 
-    #[test]
-    fn test_memory_pool() {
-        // This test would need a real GPU device, so it's just for compilation verification
+            // Evict from the largest buffers first to free space quickly.
+            if let Some((_, list)) = self
+                .pool
+                .iter_mut()
+                .max_by_key(|(key, list)| (key.size, list.len()))
+            {
+                let _ = list.pop();
+            } else {
+                break;
+            }
+
+            self.trim();
+        }
+    }
+
+    fn current_usage(&self) -> (usize, u64) {
+        let mut buffer_count = 0;
+        let mut total_bytes = 0;
+
+        for (key, list) in &self.pool {
+            let count = list.len() as u64;
+            buffer_count += count as usize;
+            total_bytes += key.size * count;
+        }
+
+        (buffer_count, total_bytes)
     }
 }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_memory_pool() {
+            let mut pool = GPUMemoryPool::new();
+            assert!(pool.get_buffer(1024, BufferUsages::MAP_READ).is_none());
+            pool.trim();
+        }
+    }

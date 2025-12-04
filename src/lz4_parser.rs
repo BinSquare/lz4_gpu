@@ -1,6 +1,8 @@
 use crate::direct_io::CrossPlatformIO;
 use crate::lz4::{LZ4BlockDescriptor, LZ4CompressedFrame, LZ4Error};
 use anyhow::{Context, Result};
+use lz4_flex::block::decompress_into;
+use xxhash_rust::xxh32::{xxh32, Xxh32};
 
 const FRAME_MAGIC: u32 = 0x184D2204;
 const SKIPPABLE_MASK: u32 = 0xFFFFFFF0;
@@ -134,6 +136,7 @@ impl LZ4FrameParser {
         let mut payload = Vec::new();
         let mut output_offset = 0;
         let mut total_uncompressed = 0;
+        let mut content_hasher = content_checksum_flag.then(|| Xxh32::new(0));
 
         loop {
             let block_header = Self::read_u32(data, &mut cursor)?;
@@ -151,12 +154,22 @@ impl LZ4FrameParser {
             let block_start = cursor;
             let block_data = &data[block_start..block_start + stored_size];
 
+            // Validate compressed and uncompressed checksums as we go to avoid silent corruption.
             let uncompressed_size = if is_compressed {
-                crate::lz4::LZ4Decompressor::measure_decompressed_size(
-                    block_data,
-                    block_size,
-                )?
+                let mut scratch = vec![0u8; block_size];
+                let decompressed_len = decompress_into(block_data, &mut scratch).map_err(|e| {
+                    anyhow::anyhow!("lz4_flex decompression failed while parsing: {}", e)
+                })?;
+
+                if let Some(hasher) = content_hasher.as_mut() {
+                    hasher.update(&scratch[..decompressed_len]);
+                }
+
+                decompressed_len
             } else {
+                if let Some(hasher) = content_hasher.as_mut() {
+                    hasher.update(block_data);
+                }
                 stored_size
             };
 
@@ -179,12 +192,35 @@ impl LZ4FrameParser {
             total_uncompressed += uncompressed_size;
 
             if block_checksum_flag {
-                Self::read_u32(data, &mut cursor)?; // Skip block checksum
+                let expected = Self::read_u32(data, &mut cursor)?;
+                let actual = xxh32(block_data, 0);
+                if expected != actual {
+                    return Err(LZ4Error::ChecksumMismatch(format!(
+                        "Block checksum mismatch at block {} (expected {:08X}, got {:08X})",
+                        blocks.len() - 1,
+                        expected,
+                        actual
+                    ))
+                    .into());
+                }
             }
         }
 
-        if content_checksum_flag {
-            Self::read_u32(data, &mut cursor)?; // Skip content checksum
+        let stored_content_checksum = if content_checksum_flag {
+            Some(Self::read_u32(data, &mut cursor)?)
+        } else {
+            None
+        };
+
+        if let (Some(expected), Some(hasher)) = (stored_content_checksum, content_hasher) {
+            let actual = hasher.digest();
+            if expected != actual {
+                return Err(LZ4Error::ChecksumMismatch(format!(
+                    "Content checksum mismatch (expected {:08X}, got {:08X})",
+                    expected, actual
+                ))
+                .into());
+            }
         }
 
         if let Some(reported) = reported_content_size {
@@ -255,4 +291,74 @@ pub struct ParsedFrame {
     pub frame: LZ4CompressedFrame,
     pub file_size: usize,
     pub file_path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_test_frame(
+        flg: u8,
+        block_data: &[u8],
+        block_checksum: Option<u32>,
+        content_checksum: Option<u32>,
+    ) -> Vec<u8> {
+        let mut frame = Vec::new();
+
+        // Magic
+        frame.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
+
+        // FLG and BD (64KB block size)
+        frame.push(flg);
+        frame.push(0x40);
+
+        // Header checksum placeholder (parser currently skips)
+        frame.push(0);
+
+        // Block header (uncompressed block)
+        let block_header = 0x8000_0000u32 | (block_data.len() as u32);
+        frame.extend_from_slice(&block_header.to_le_bytes());
+
+        // Block payload
+        frame.extend_from_slice(block_data);
+
+        // Optional block checksum
+        if let Some(cs) = block_checksum {
+            frame.extend_from_slice(&cs.to_le_bytes());
+        }
+
+        // End marker
+        frame.extend_from_slice(&0u32.to_le_bytes());
+
+        // Optional content checksum
+        if let Some(cs) = content_checksum {
+            frame.extend_from_slice(&cs.to_le_bytes());
+        }
+
+        frame
+    }
+
+    #[test]
+    fn block_checksum_mismatch_is_rejected() {
+        let data = b"hello";
+        let flg = 0x70; // version=1, block independence, block checksum
+        let bad_block_checksum = xxh32(data, 0) ^ 0xFFFF;
+        let frame = build_test_frame(flg, data, Some(bad_block_checksum), None);
+
+        let err = LZ4FrameParser::parse(&frame).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Block checksum mismatch"));
+    }
+
+    #[test]
+    fn content_checksum_mismatch_is_rejected() {
+        let data = b"world";
+        let flg = 0x64; // version=1, block independence, content checksum
+        let bad_content_checksum = xxh32(data, 0) ^ 0x1234;
+        let frame = build_test_frame(flg, data, None, Some(bad_content_checksum));
+
+        let err = LZ4FrameParser::parse(&frame).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Content checksum mismatch"));
+    }
 }

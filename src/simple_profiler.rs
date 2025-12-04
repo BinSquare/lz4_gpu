@@ -1,4 +1,4 @@
-//! Simple performance profiling for FilesCanFly
+//! Simple performance profiling for lz4_gpu 
 //! This module provides simplified performance testing without complex GPU context management
 
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ impl SimpleProfiler {
         }
     }
 
-    pub fn start_timer(&mut self, name: &str) -> TimerGuard {
+    pub fn start_timer(&mut self, name: &str) -> TimerGuard<'_> {
         TimerGuard::new(name.to_string(), self)
     }
 
