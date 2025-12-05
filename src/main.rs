@@ -23,6 +23,14 @@ struct Args {
     #[arg(long)]
     disable_gpu: bool,
 
+    /// Maximum per-batch payload size for GPU in bytes (default: 1.5 GiB)
+    #[arg(long, default_value_t = 1_610_612_736)] // 1.5 GiB
+    gpu_batch_bytes: usize,
+
+    /// Maximum blocks per GPU batch
+    #[arg(long, default_value_t = 256)]
+    gpu_batch_blocks: usize,
+
     /// Output file (default: stdout)
     #[arg(short, long, value_name = "OUTPUT_FILE")]
     output: Option<String>,
@@ -220,8 +228,10 @@ async fn run_profile(
 }
 
 async fn run_streaming(decompressor: &Decompressor, input_path: &str, args: &Args) -> Result<()> {
-    let mut stream =
-        files_can_fly_rust::lz4_parser::LZ4FrameStream::from_file(input_path, 256)?;
+    let mut stream = files_can_fly_rust::lz4_parser::LZ4FrameStream::from_file(
+        input_path,
+        args.gpu_batch_blocks,
+    )?;
     if let Some(content_size) = stream.reported_content_size() {
         println!("Reported content size: {} bytes", content_size);
     } else {
@@ -245,9 +255,18 @@ async fn run_streaming(decompressor: &Decompressor, input_path: &str, args: &Arg
 
     while let Some(frame) = stream.next_batch()? {
         if use_gpu {
-            decompressor
-                .decompress_gpu_to_writer(&frame, &mut writer)
-                .await?;
+            // Split oversized batches further to keep per-dispatch payload/output <4GiB.
+            for subframe in files_can_fly_rust::GPUDecompressor::split_frame_for_gpu(
+                &frame,
+                args.gpu_batch_bytes,
+            )? {
+                decompressor
+                    .decompress_gpu_to_writer(&subframe, &mut writer)
+                    .await?;
+                total_written = total_written
+                    .checked_add(subframe.uncompressed_size)
+                    .ok_or_else(|| anyhow!("Output size overflow"))?;
+            }
             total_written = total_written
                 .checked_add(frame.uncompressed_size)
                 .ok_or_else(|| anyhow!("Output size overflow"))?;

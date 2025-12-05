@@ -29,33 +29,15 @@ impl AsyncGPUProcessor {
 
         let semaphore = Arc::new(Semaphore::new(self.max_in_flight));
         let (tx, mut rx) = mpsc::channel::<(usize, Result<Vec<u8>>)>(self.max_in_flight);
-        let mut join_handles = Vec::with_capacity(frames.len());
+        let join_handles = self.spawn_workers(frames, semaphore, tx).await?;
 
-        for (idx, frame) in frames.into_iter().enumerate() {
-            let permit = semaphore.clone().acquire_owned().await?;
-            let tx = tx.clone();
-            let gpu = self.gpu_decompressor.clone();
-            let handle = tokio::spawn(async move {
-                let _permit = permit; // hold until task completes
-                let res = gpu.decompress(&frame).await;
-                let _ = tx.send((idx, res)).await;
-            });
-            join_handles.push(handle);
-        }
-        drop(tx); // close sender when tasks finish
-
-        // Collect results as they complete
         let mut results: Vec<Option<Vec<u8>>> = vec![None; join_handles.len()];
         while let Some((idx, res)) = rx.recv().await {
             results[idx] = Some(res?);
         }
 
-        // Ensure all tasks are joined to surface panics
-        for handle in join_handles {
-            handle.await?;
-        }
+        self.join_workers(join_handles).await?;
 
-        // Convert to Vec<Vec<u8>>
         let mut ordered = Vec::with_capacity(results.len());
         for opt in results {
             ordered.push(opt.expect("missing result for frame"));
@@ -71,6 +53,37 @@ impl AsyncGPUProcessor {
             final_output.extend(chunk);
         }
         Ok(final_output)
+    }
+
+    async fn spawn_workers(
+        &self,
+        frames: Vec<LZ4CompressedFrame>,
+        semaphore: Arc<Semaphore>,
+        tx: mpsc::Sender<(usize, Result<Vec<u8>>)>,
+    ) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+        let mut join_handles = Vec::with_capacity(frames.len());
+        for (idx, frame) in frames.into_iter().enumerate() {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let tx = tx.clone();
+            let gpu = self.gpu_decompressor.clone();
+            let handle = tokio::spawn(async move {
+                let _permit = permit;
+                let res = gpu.decompress(&frame).await;
+                let _ = tx.send((idx, res)).await;
+            });
+            join_handles.push(handle);
+        }
+        Ok(join_handles)
+    }
+
+    async fn join_workers(
+        &self,
+        join_handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> Result<()> {
+        for handle in join_handles {
+            handle.await?;
+        }
+        Ok(())
     }
 }
 

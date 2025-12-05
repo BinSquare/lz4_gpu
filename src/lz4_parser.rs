@@ -12,6 +12,85 @@ const MAX_BLOCKS: usize = 1_000_000; // Prevent runaway allocation on malformed 
 pub struct LZ4FrameParser;
 
 impl LZ4FrameParser {
+    /// Measure uncompressed size of a compressed block without emitting bytes.
+    pub fn measure_block_size(block_data: &[u8], block_max: usize) -> Result<usize> {
+        let mut src = 0usize;
+        let src_end = block_data.len();
+        let mut dst: usize = 0;
+
+        while src < src_end {
+            let token = block_data[src];
+            src += 1;
+
+            let mut literal_len = (token >> 4) as usize;
+            if literal_len == 15 {
+                loop {
+                    if src >= src_end {
+                        return Err(LZ4Error::MalformedStream.into());
+                    }
+                    let b = block_data[src] as usize;
+                    src += 1;
+                    literal_len = literal_len
+                        .checked_add(b)
+                        .ok_or_else(|| anyhow::anyhow!("Literal length overflow"))?;
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+
+            if src.checked_add(literal_len).filter(|v| *v <= src_end).is_none() {
+                return Err(LZ4Error::MalformedStream.into());
+            }
+            dst = dst
+                .checked_add(literal_len)
+                .ok_or_else(|| anyhow::anyhow!("Literal output overflow"))?;
+            if dst > block_max {
+                return Err(LZ4Error::OutputOverflow.into());
+            }
+            src += literal_len;
+
+            if src >= src_end {
+                break;
+            }
+
+            if src + 2 > src_end {
+                return Err(LZ4Error::MalformedStream.into());
+            }
+            let offset = (block_data[src] as usize) | ((block_data[src + 1] as usize) << 8);
+            src += 2;
+            if offset == 0 || offset > dst {
+                return Err(LZ4Error::MalformedStream.into());
+            }
+
+            let mut match_len = (token & 0x0F) as usize + 4;
+            if (token & 0x0F) == 0x0F {
+                loop {
+                    if src >= src_end {
+                        return Err(LZ4Error::MalformedStream.into());
+                    }
+                    let b = block_data[src] as usize;
+                    src += 1;
+                    match_len = match_len
+                        .checked_add(b)
+                        .ok_or_else(|| anyhow::anyhow!("Match length overflow"))?;
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+
+            dst = dst
+                .checked_add(match_len)
+                .ok_or_else(|| anyhow::anyhow!("Match output overflow"))?;
+            if dst > block_max {
+                return Err(LZ4Error::OutputOverflow.into());
+            }
+        }
+
+        Ok(dst)
+    }
+
     pub fn parse_file(path: &str) -> Result<ParsedFrame> {
         let data = std::fs::read(path).with_context(|| format!("Failed to read file: {}", path))?;
 
@@ -142,7 +221,7 @@ impl LZ4FrameParser {
 
         let mut blocks = Vec::new();
         let mut payload = Vec::new();
-        let mut output_offset: usize = 0;
+        let mut output_offset: u64 = 0;
         let mut total_uncompressed: usize = 0;
         let mut content_hasher = content_checksum_flag.then(|| Xxh32::new(0));
 
@@ -180,16 +259,21 @@ impl LZ4FrameParser {
 
             // Validate compressed and uncompressed checksums as we go to avoid silent corruption.
             let uncompressed_size = if is_compressed {
-                let mut scratch = vec![0u8; block_size];
-                let decompressed_len = decompress_into(block_data, &mut scratch).map_err(|e| {
-                    anyhow::anyhow!("lz4_flex decompression failed while parsing: {}", e)
-                })?;
+                if content_checksum_flag {
+                    let mut scratch = vec![0u8; block_size];
+                    let decompressed_len =
+                        decompress_into(block_data, &mut scratch).map_err(|e| {
+                            anyhow::anyhow!("lz4_flex decompression failed while parsing: {}", e)
+                        })?;
 
-                if let Some(hasher) = content_hasher.as_mut() {
-                    hasher.update(&scratch[..decompressed_len]);
+                    if let Some(hasher) = content_hasher.as_mut() {
+                        hasher.update(&scratch[..decompressed_len]);
+                    }
+
+                    decompressed_len
+                } else {
+                    Self::measure_block_size(block_data, block_size)?
                 }
-
-                decompressed_len
             } else {
                 if let Some(hasher) = content_hasher.as_mut() {
                     hasher.update(block_data);
@@ -202,30 +286,19 @@ impl LZ4FrameParser {
             }
 
             let compressed_offset = payload.len();
-            let new_payload_len = payload
+            payload
                 .len()
                 .checked_add(stored_size)
                 .ok_or_else(|| anyhow::anyhow!("Compressed payload size overflow"))?;
             let new_output_offset = output_offset
-                .checked_add(uncompressed_size)
+                .checked_add(uncompressed_size as u64)
                 .ok_or_else(|| anyhow::anyhow!("Output size overflow"))?;
-
-            if compressed_offset > u32::MAX as usize
-                || new_payload_len > u32::MAX as usize
-                || output_offset > u32::MAX as usize
-                || uncompressed_size > u32::MAX as usize
-            {
-                return Err(LZ4Error::UnsupportedFrame(
-                    "Frame too large for 32-bit block descriptors".to_string(),
-                )
-                .into());
-            }
 
             let descriptor = LZ4BlockDescriptor {
                 compressed_size: stored_size as u32,
                 uncompressed_size: uncompressed_size as u32,
-                compressed_offset: compressed_offset as u32,
-                output_offset: output_offset as u32,
+                compressed_offset: compressed_offset as u64,
+                output_offset,
                 is_compressed,
             };
 
@@ -307,7 +380,7 @@ impl LZ4FrameParser {
         })
     }
 
-    pub(crate) fn compute_header_checksum(header_bytes: &[u8]) -> u8 {
+    pub fn compute_header_checksum(header_bytes: &[u8]) -> u8 {
         (xxh32(header_bytes, 0) >> 8) as u8
     }
 
@@ -507,8 +580,7 @@ impl<R: std::io::Read> LZ4FrameStream<R> {
             }
 
             let (block_data, is_compressed) = self.read_block(header)?;
-            let uncompressed_size =
-                self.validate_and_size_block(&block_data, is_compressed)? as usize;
+            let uncompressed_size = self.validate_and_size_block(&block_data, is_compressed)?;
 
             self.append_block(
                 &mut blocks,
@@ -547,6 +619,11 @@ impl<R: std::io::Read> LZ4FrameStream<R> {
 
     pub fn total_uncompressed(&self) -> usize {
         self.total_uncompressed
+    }
+
+    /// Measure uncompressed size of a compressed block without emitting bytes.
+    fn measure_block_size(block_data: &[u8], block_max: usize) -> Result<usize> {
+        LZ4FrameParser::measure_block_size(block_data, block_max)
     }
 
     fn read_block(&mut self, block_header: u32) -> Result<(Vec<u8>, bool)> {
@@ -588,16 +665,20 @@ impl<R: std::io::Read> LZ4FrameStream<R> {
         is_compressed: bool,
     ) -> Result<usize> {
         let size = if is_compressed {
-            let len = decompress_into(block_data, &mut self.scratch).map_err(|e| {
-                anyhow::anyhow!("lz4_flex decompression failed while sizing block: {}", e)
-            })?;
-            if len > self.block_size {
-                return Err(LZ4Error::OutputOverflow.into());
+            if self.content_checksum_flag {
+                let len = decompress_into(block_data, &mut self.scratch).map_err(|e| {
+                    anyhow::anyhow!("lz4_flex decompression failed while sizing block: {}", e)
+                })?;
+                if len > self.block_size {
+                    return Err(LZ4Error::OutputOverflow.into());
+                }
+                if let Some(hasher) = self.content_hasher.as_mut() {
+                    hasher.update(&self.scratch[..len]);
+                }
+                len
+            } else {
+                Self::measure_block_size(block_data, self.block_size)?
             }
-            if let Some(hasher) = self.content_hasher.as_mut() {
-                hasher.update(&self.scratch[..len]);
-            }
-            len
         } else {
             if let Some(hasher) = self.content_hasher.as_mut() {
                 hasher.update(block_data);
@@ -619,7 +700,7 @@ impl<R: std::io::Read> LZ4FrameStream<R> {
     ) -> Result<()> {
         let stored_size = block_data.len();
         let compressed_offset = payload.len();
-        let new_payload_len = payload
+        payload
             .len()
             .checked_add(stored_size)
             .ok_or_else(|| anyhow::anyhow!("Compressed payload size overflow"))?;
@@ -627,22 +708,11 @@ impl<R: std::io::Read> LZ4FrameStream<R> {
             .checked_add(uncompressed_size)
             .ok_or_else(|| anyhow::anyhow!("Output size overflow"))?;
 
-        if compressed_offset > u32::MAX as usize
-            || new_payload_len > u32::MAX as usize
-            || *batch_uncompressed > u32::MAX as usize
-            || uncompressed_size > u32::MAX as usize
-        {
-            return Err(LZ4Error::UnsupportedFrame(
-                "Frame too large for 32-bit block descriptors".to_string(),
-            )
-            .into());
-        }
-
         let descriptor = LZ4BlockDescriptor {
             compressed_size: stored_size as u32,
             uncompressed_size: uncompressed_size as u32,
-            compressed_offset: compressed_offset as u32,
-            output_offset: *batch_uncompressed as u32,
+            compressed_offset: compressed_offset as u64,
+            output_offset: *batch_uncompressed as u64,
             is_compressed,
         };
 

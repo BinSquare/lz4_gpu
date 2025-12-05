@@ -270,6 +270,112 @@ impl GPUDecompressor {
         Ok(())
     }
 
+    /// Split a frame into subframes that fit within GPU per-dispatch limits.
+    /// Keeps compressed payload and padded output under 4GiB for WGSL/u32 indexing.
+    pub fn split_frame_for_gpu(
+        frame: &LZ4CompressedFrame,
+        max_batch_bytes: usize,
+    ) -> Result<Vec<LZ4CompressedFrame>> {
+        if frame.blocks.is_empty() {
+            return Ok(vec![frame.clone()]);
+        }
+
+        let mut batches = Vec::new();
+        let mut current_blocks = Vec::new();
+        let mut current_payload = Vec::new();
+        let mut current_uncompressed: usize = 0;
+        let mut output_cursor: u64 = 0;
+        let mut padded_cursor_words: u64 = 0;
+
+        for block in &frame.blocks {
+            let _padded_offset_bytes = padded_cursor_words
+                .checked_mul(4)
+                .context("Padded output offset overflow")?;
+            let padded_block_words = ((block.uncompressed_size as u64) + 3) / 4;
+            let new_padded_cursor = padded_cursor_words
+                .checked_add(padded_block_words)
+                .context("Padded output length overflow")?;
+
+            let block_start = block.compressed_offset as usize;
+            let block_end = block_start + block.compressed_size as usize;
+            let block_bytes = &frame.payload[block_start..block_end];
+
+            let new_payload_len = current_payload
+                .len()
+                .checked_add(block_bytes.len())
+                .ok_or_else(|| anyhow::anyhow!("Compressed payload size overflow"))?;
+            let new_output_bytes = new_padded_cursor
+                .checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("Padded output length overflow"))?;
+
+            let would_exceed =
+                new_payload_len > max_batch_bytes || new_output_bytes > max_batch_bytes as u64;
+
+            if would_exceed && !current_blocks.is_empty() {
+                batches.push(Self::make_subframe(
+                    &current_blocks,
+                    &current_payload,
+                    current_uncompressed,
+                    frame.block_size,
+                    frame.uses_block_checksum,
+                )?);
+                current_blocks.clear();
+                current_payload.clear();
+                current_uncompressed = 0;
+                output_cursor = 0;
+                padded_cursor_words = 0;
+            }
+
+            let offset_in_batch = current_payload.len() as u64;
+            current_payload.extend_from_slice(block_bytes);
+            current_blocks.push(LZ4BlockDescriptor {
+                compressed_size: block.compressed_size,
+                uncompressed_size: block.uncompressed_size,
+                compressed_offset: offset_in_batch,
+                output_offset: output_cursor,
+                is_compressed: block.is_compressed,
+            });
+
+            output_cursor = output_cursor
+                .checked_add(block.uncompressed_size as u64)
+                .ok_or_else(|| anyhow::anyhow!("Output offset overflow"))?;
+            padded_cursor_words = new_padded_cursor;
+            current_uncompressed = current_uncompressed
+                .checked_add(block.uncompressed_size as usize)
+                .ok_or_else(|| anyhow::anyhow!("Batch uncompressed overflow"))?;
+        }
+
+        if !current_blocks.is_empty() {
+            batches.push(Self::make_subframe(
+                &current_blocks,
+                &current_payload,
+                current_uncompressed,
+                frame.block_size,
+                frame.uses_block_checksum,
+            )?);
+        }
+
+        Ok(batches)
+    }
+
+    fn make_subframe(
+        blocks: &[LZ4BlockDescriptor],
+        payload: &[u8],
+        uncompressed_size: usize,
+        block_size: usize,
+        uses_block_checksum: bool,
+    ) -> Result<LZ4CompressedFrame> {
+        Ok(LZ4CompressedFrame {
+            uncompressed_size,
+            block_size,
+            blocks: blocks.to_vec(),
+            payload: Arc::from(payload.to_vec()),
+            total_compressed_bytes: payload.len(),
+            reported_content_size: Some(uncompressed_size),
+            uses_block_checksum,
+        })
+    }
+
     /// Decompress with optional direct I/O path for unified memory systems
     pub async fn decompress_with_options(
         &self,
@@ -322,7 +428,7 @@ impl GPUDecompressor {
             .payload
             .len()
             .try_into()
-            .context("Compressed payload too large for GPU path")?;
+            .context("GPU path does not support compressed payloads larger than 4GiB")?;
 
         let (gpu_blocks, padded_offsets, output_size_bytes, output_length) =
             self.build_block_metadata(frame)?;
@@ -348,6 +454,13 @@ impl GPUDecompressor {
         let mut pool = self.device.memory_pool.lock().unwrap();
         buffers.return_to_pool(&mut pool);
         Ok(())
+    }
+
+    fn lock_pool(&self) -> Result<std::sync::MutexGuard<'_, GPUMemoryPool>> {
+        self.device
+            .memory_pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPU memory pool lock poisoned"))
     }
 
     /// Stream a file through the GPU in batches to avoid holding the entire compressed payload in memory.
@@ -401,7 +514,8 @@ impl GPUDecompressor {
                 .context("Padded output length overflow")?;
 
             gpu_blocks.push(GPUBlockInfo {
-                compressed_offset: block.compressed_offset,
+                compressed_offset: u32::try_from(block.compressed_offset)
+                    .context("GPU path only supports per-batch compressed offsets up to 4GiB")?,
                 compressed_size: block.compressed_size,
                 output_offset: u32::try_from(padded_offset_bytes)
                     .context("Padded output offset too large for GPU path")?,
@@ -421,7 +535,7 @@ impl GPUDecompressor {
             .max(1);
         let output_length: u32 = output_size_bytes
             .try_into()
-            .context("Output size too large for GPU path")?;
+            .context("GPU path does not support outputs larger than 4GiB")?;
 
         Ok((gpu_blocks, padded_offsets, output_size_bytes, output_length))
     }
@@ -448,7 +562,7 @@ impl GPUDecompressor {
         let payload_size =
             ((payload_u32.len() as u64) * (std::mem::size_of::<u32>() as u64)).max(1);
         let payload_buffer = {
-            let mut pool = self.device.memory_pool.lock().unwrap();
+            let mut pool = self.lock_pool()?;
             let buffer = if let Some(pool_buffer) = pool.get_buffer(payload_size, payload_usage) {
                 pool_buffer
             } else {
@@ -465,7 +579,7 @@ impl GPUDecompressor {
         let block_info_size =
             ((gpu_blocks.len() as u64) * (std::mem::size_of::<GPUBlockInfo>() as u64)).max(1);
         let block_info_buffer = {
-            let mut pool = self.device.memory_pool.lock().unwrap();
+            let mut pool = self.lock_pool()?;
             let buffer = if let Some(pool_buffer) = pool.get_buffer(block_info_size, block_info_usage)
             {
                 pool_buffer
@@ -481,7 +595,7 @@ impl GPUDecompressor {
 
         let output_usage = BufferUsages::STORAGE | BufferUsages::COPY_SRC;
         let output_buffer = {
-            let mut pool = self.device.memory_pool.lock().unwrap();
+            let mut pool = self.lock_pool()?;
             if let Some(pool_buffer) = pool.get_buffer(output_size_bytes, output_usage) {
                 pool_buffer
             } else {
@@ -491,7 +605,7 @@ impl GPUDecompressor {
 
         let staging_output_usage = BufferUsages::MAP_READ | BufferUsages::COPY_DST;
         let staging_output_buffer = {
-            let mut pool = self.device.memory_pool.lock().unwrap();
+            let mut pool = self.lock_pool()?;
             if let Some(pool_buffer) = pool.get_buffer(output_size_bytes, staging_output_usage) {
                 pool_buffer
             } else {
@@ -506,7 +620,7 @@ impl GPUDecompressor {
         let config_usage = BufferUsages::UNIFORM | BufferUsages::COPY_DST;
         let config_size = std::mem::size_of::<KernelConfig>() as u64;
         let config_buffer = {
-            let mut pool = self.device.memory_pool.lock().unwrap();
+            let mut pool = self.lock_pool()?;
             let buffer = if let Some(pool_buffer) = pool.get_buffer(config_size, config_usage) {
                 pool_buffer
             } else {
@@ -523,7 +637,7 @@ impl GPUDecompressor {
             BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
         let status_size = (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4);
         let status_buffer = {
-            let mut pool = self.device.memory_pool.lock().unwrap();
+            let mut pool = self.lock_pool()?;
             let buffer = if let Some(pool_buffer) = pool.get_buffer(status_size, status_usage) {
                 pool_buffer
             } else {
@@ -540,7 +654,7 @@ impl GPUDecompressor {
         let status_readback_size = (status_init.len() as u64 * std::mem::size_of::<u32>() as u64)
             .max(4);
         let status_staging = {
-            let mut pool = self.device.memory_pool.lock().unwrap();
+            let mut pool = self.lock_pool()?;
             if let Some(pool_buffer) =
                 pool.get_buffer(status_readback_size, status_readback_usage)
             {
@@ -675,7 +789,7 @@ impl GPUDecompressor {
         let status_data = status_slice.get_mapped_range();
         let mut gpu_error: Option<(usize, u32)> = None;
         for (idx, chunk) in status_data.chunks(4).enumerate() {
-            let val = u32::from_le_bytes(chunk.try_into().unwrap());
+            let val = u32::from_le_bytes(chunk.try_into().unwrap_or_default());
             if val != 0 {
                 gpu_error = Some((idx, val));
                 break;

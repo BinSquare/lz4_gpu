@@ -6,8 +6,8 @@ use std::sync::Arc;
 pub struct LZ4BlockDescriptor {
     pub compressed_size: u32,
     pub uncompressed_size: u32,
-    pub compressed_offset: u32,
-    pub output_offset: u32,
+    pub compressed_offset: u64,
+    pub output_offset: u64,
     pub is_compressed: bool,
 }
 
@@ -89,7 +89,7 @@ impl LZ4Decompressor {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency)
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build rayon thread pool: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to build rayon thread pool: {}", e))?;
 
         // Process blocks in parallel and collect individual results
         // This avoids the borrowing issue by creating separate output buffers
