@@ -1,7 +1,6 @@
 use anyhow::Result;
 
 pub mod async_pipeline;
-pub mod chunked_pipeline;
 pub mod gpu;
 pub mod hybrid;
 pub mod lz4;
@@ -15,7 +14,6 @@ pub mod streaming_pipeline;
 pub use gpu::{GPUDecompressor, GPUDevice};
 pub use lz4::{LZ4BlockDescriptor, LZ4CompressedFrame, LZ4Decompressor};
 pub use lz4_parser::{LZ4FrameParser, ParsedFrame};
-pub use chunked_pipeline::{ChunkedDecompressStats, ChunkedDecompressor};
 
 /// Main decompressor that can use both CPU and GPU backends
 pub struct Decompressor {

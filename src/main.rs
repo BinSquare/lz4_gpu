@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use files_can_fly_rust::{ChunkedDecompressor, Decompressor};
+use files_can_fly_rust::Decompressor;
 use files_can_fly_rust::lz4::LZ4Error;
 use anyhow::anyhow;
 use std::path::Path;
@@ -161,59 +161,14 @@ async fn main() -> Result<()> {
         result
     } else {
         // Normal operation
-        if let Some(output_path) = args.output.clone() {
-            if !args.disable_gpu && decompressor.has_gpu() {
-                // GPU path still requires the full frame in memory.
-                let parsed = ensure_parsed_frame(&mut parsed, &input_path)?;
-                println!(
-                    "Uncompressed size: {} bytes",
-                    parsed.frame.uncompressed_size
-                );
-                println!("Blocks: {}", parsed.frame.blocks.len());
-
-                let start = Instant::now();
-                match decompressor.decompress_gpu(&parsed.frame).await {
-                    Ok(data) => {
-                        let duration = start.elapsed();
-                        println!(
-                            "GPU decompression completed in: {:.2?}ms",
-                            duration.as_millis() as f64
-                        );
-                        std::fs::write(&output_path, &data)?;
-                        println!("Decompressed data written to: {}", output_path);
-                        println!("✅ Decompression completed successfully!");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️  GPU path failed: {e}");
-                        return Err(e);
-                    }
-                }
-            } else {
-                // Memory-bounded streaming CPU path.
-                println!("Streaming CPU decompression with bounded buffers...");
-                let start = Instant::now();
-                let stats = ChunkedDecompressor::new()
-                    .decompress_file_to_path(&input_path, &output_path)?;
-                let duration = start.elapsed();
-                println!(
-                    "Decompressed {} bytes across {} blocks in {:.2?}",
-                    stats.uncompressed_size, stats.blocks, duration
-                );
-                println!("Decompressed data written to: {}", output_path);
-                println!("✅ Decompression completed successfully!");
-                return Ok(());
-            }
-        }
+        let parsed = ensure_parsed_frame(&mut parsed, &input_path)?;
+        println!(
+            "Uncompressed size: {} bytes",
+            parsed.frame.uncompressed_size
+        );
+        println!("Blocks: {}", parsed.frame.blocks.len());
 
         if !args.disable_gpu && decompressor.has_gpu() {
-            let parsed = ensure_parsed_frame(&mut parsed, &input_path)?;
-            println!(
-                "Uncompressed size: {} bytes",
-                parsed.frame.uncompressed_size
-            );
-            println!("Blocks: {}", parsed.frame.blocks.len());
-
             let start = Instant::now();
             match decompressor.decompress_gpu(&parsed.frame).await {
                 Ok(data) => {
@@ -231,13 +186,6 @@ async fn main() -> Result<()> {
             }
         } else {
             let concurrency = args.cpu_threads.unwrap_or(num_cpus::get());
-            let parsed = ensure_parsed_frame(&mut parsed, &input_path)?;
-            println!(
-                "Uncompressed size: {} bytes",
-                parsed.frame.uncompressed_size
-            );
-            println!("Blocks: {}", parsed.frame.blocks.len());
-
             let start = Instant::now();
             let data = decompressor.decompress_cpu(&parsed.frame, Some(concurrency))?;
             let duration = start.elapsed();
