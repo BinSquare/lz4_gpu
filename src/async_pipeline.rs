@@ -1,144 +1,116 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::{GPUDecompressor, LZ4CompressedFrame};
 
+/// Runs GPU decompression for multiple frames with bounded concurrency to keep the device busy.
 pub struct AsyncGPUProcessor {
-    gpu_decompressor: Arc<Mutex<GPUDecompressor>>,
-    pipeline_depth: usize,
-}
-
-pub struct PipelineResult {
-    pub decompressed_data: Vec<u8>,
-    pub frame_index: usize,
+    gpu_decompressor: GPUDecompressor,
+    max_in_flight: usize,
 }
 
 impl AsyncGPUProcessor {
-    pub fn new(gpu_decompressor: GPUDecompressor, pipeline_depth: usize) -> Result<Self> {
+    pub fn new(gpu_decompressor: GPUDecompressor, max_in_flight: usize) -> Result<Self> {
         Ok(Self {
-            gpu_decompressor: Arc::new(Mutex::new(gpu_decompressor)),
-            pipeline_depth: pipeline_depth.max(2), // Minimum 2 for overlap
+            gpu_decompressor,
+            max_in_flight: max_in_flight.max(1),
         })
     }
 
+    /// Decompress a batch of frames concurrently, preserving order.
     pub async fn process_async_pipeline(
         &self,
         frames: Vec<LZ4CompressedFrame>,
     ) -> Result<Vec<Vec<u8>>> {
-        let num_frames = frames.len();
-
-        // Create channels for pipeline stages
-        let (send_queue, mut recv_queue) =
-            mpsc::channel::<(usize, LZ4CompressedFrame)>(self.pipeline_depth);
-        let (send_result, mut recv_result) = mpsc::channel::<PipelineResult>(self.pipeline_depth);
-
-        // Spawn the result processing task
-        let results_mutex = Arc::new(Mutex::new(Vec::with_capacity(num_frames)));
-        let results_clone = results_mutex.clone();
-
-        let result_handler = tokio::spawn(async move {
-            let mut completed_count = 0;
-            let mut completed_results = vec![None; num_frames];
-
-            while completed_count < num_frames {
-                if let Some(result) = recv_result.recv().await {
-                    let data = result.decompressed_data;
-                    completed_results[result.frame_index] = Some(data.clone());
-                    completed_count += 1;
-
-                    // Store in original order
-                    let mut results = results_clone.lock().await;
-                    results.resize(num_frames, Vec::new());
-                    results[result.frame_index] = data;
-                }
-            }
-
-            results_clone.lock().await.clone()
-        });
-
-        // Spawn decompression tasks
-        let gpu_decompressor = self.gpu_decompressor.clone();
-        let result_sender = send_result.clone();
-
-        let executor = tokio::spawn(async move {
-            while let Some((index, frame)) = recv_queue.recv().await {
-                let gpu = gpu_decompressor.lock().await;
-                match gpu.decompress(&frame).await {
-                    Ok(data) => {
-                        let _ = result_sender
-                            .send(PipelineResult {
-                                decompressed_data: data,
-                                frame_index: index,
-                            })
-                            .await;
-                    }
-                    Err(_e) => {}
-                }
-            }
-        });
-
-        // Send frames to the queue
-        for (index, frame) in frames.into_iter().enumerate() {
-            send_queue.send((index, frame)).await?;
+        if frames.is_empty() {
+            return Ok(vec![]);
         }
 
-        // Wait for all operations to complete
-        drop(send_queue); // Close the input channel
-        let decompressed_data = result_handler.await?;
-        executor.await?; // Wait for the executor to finish
+        let semaphore = Arc::new(Semaphore::new(self.max_in_flight));
+        let (tx, mut rx) = mpsc::channel::<(usize, Result<Vec<u8>>)>(self.max_in_flight);
+        let mut join_handles = Vec::with_capacity(frames.len());
 
-        Ok(decompressed_data)
+        for (idx, frame) in frames.into_iter().enumerate() {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let tx = tx.clone();
+            let gpu = self.gpu_decompressor.clone();
+            let handle = tokio::spawn(async move {
+                let _permit = permit; // hold until task completes
+                let res = gpu.decompress(&frame).await;
+                let _ = tx.send((idx, res)).await;
+            });
+            join_handles.push(handle);
+        }
+        drop(tx); // close sender when tasks finish
+
+        // Collect results as they complete
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; join_handles.len()];
+        while let Some((idx, res)) = rx.recv().await {
+            results[idx] = Some(res?);
+        }
+
+        // Ensure all tasks are joined to surface panics
+        for handle in join_handles {
+            handle.await?;
+        }
+
+        // Convert to Vec<Vec<u8>>
+        let mut ordered = Vec::with_capacity(results.len());
+        for opt in results {
+            ordered.push(opt.expect("missing result for frame"));
+        }
+        Ok(ordered)
     }
 
-    /// Process a stream of frames asynchronously with continuous GPU utilization
+    /// Decompress and concatenate all frames in order.
     pub async fn process_stream_async(&self, frames: Vec<LZ4CompressedFrame>) -> Result<Vec<u8>> {
-        let all_results = self.process_async_pipeline(frames).await?;
+        let batches = self.process_async_pipeline(frames).await?;
         let mut final_output = Vec::new();
-
-        for result in all_results {
-            final_output.extend(result);
+        for chunk in batches {
+            final_output.extend(chunk);
         }
-
         Ok(final_output)
-    }
-
-    /// Process with adaptive batching based on GPU saturation
-    pub async fn process_adaptive_batch(
-        &self,
-        frames: &[LZ4CompressedFrame],
-        max_batch_size: usize,
-    ) -> Result<Vec<Vec<u8>>> {
-        let mut all_results = Vec::new();
-
-        for chunk in frames.chunks(max_batch_size) {
-            let chunk_vec: Vec<LZ4CompressedFrame> = chunk.to_vec();
-            let chunk_results = self.process_async_pipeline(chunk_vec).await?;
-            all_results.extend(chunk_results);
-        }
-
-        Ok(all_results)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Decompressor;
+    use crate::{Decompressor, LZ4Decompressor, LZ4FrameParser};
+    use std::io::Write;
+
+    async fn make_test_frames() -> Result<Vec<LZ4CompressedFrame>> {
+        let mut frames = Vec::new();
+        for i in 0..3u32 {
+            let mut data = Vec::new();
+            for j in 0..512u32 {
+                data.extend_from_slice(&i.to_le_bytes());
+                data.extend_from_slice(&j.to_le_bytes());
+            }
+            let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            encoder.write_all(&data)?;
+            let compressed = encoder.finish()?;
+            let parsed = LZ4FrameParser::parse(&compressed)?;
+            frames.push(parsed);
+        }
+        Ok(frames)
+    }
 
     #[tokio::test]
-    async fn test_async_pipeline() -> Result<()> {
-        // Create a decompressor and extract GPU
+    async fn test_async_pipeline_orders_results() -> Result<()> {
         let decompressor = Decompressor::new()?;
-        if let Some(gpu) = decompressor.gpu_decompressor {
-            let _processor = AsyncGPUProcessor::new(gpu, 3)?;
+        if let Some(gpu) = decompressor.get_gpu_decompressor() {
+            let processor = AsyncGPUProcessor::new(gpu.clone(), 2)?;
+            let frames = make_test_frames().await?;
+            let cpu = LZ4Decompressor::new();
 
-            // This would need actual test frames to work properly
-
-            Ok(())
-        } else {
-            Ok(())
+            let gpu_results = processor.process_async_pipeline(frames.clone()).await?;
+            for (idx, frame) in frames.iter().enumerate() {
+                let cpu_data = cpu.decompress(frame, Some(2))?;
+                assert_eq!(gpu_results[idx], cpu_data);
+            }
         }
+        Ok(())
     }
 }

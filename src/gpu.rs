@@ -1,6 +1,8 @@
-use crate::lz4::LZ4CompressedFrame;
+use crate::lz4::{LZ4BlockDescriptor, LZ4CompressedFrame};
+use crate::lz4_parser::LZ4FrameStream;
 use crate::memory_pool::GPUMemoryPool;
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use wgpu::*;
@@ -58,11 +60,64 @@ pub struct GPUDevice {
     queue: Arc<Queue>,
     compute_pipeline: Arc<ComputePipeline>,
     memory_pool: Arc<Mutex<GPUMemoryPool>>,
+    adapter_info: AdapterInfo,
+    adapter_limits: Limits,
 }
 
 #[derive(Clone)]
 pub struct GPUDecompressor {
     device: Arc<GPUDevice>,
+}
+
+struct DispatchBuffers {
+    payload_buffer: Buffer,
+    block_info_buffer: Buffer,
+    output_buffer: Buffer,
+    staging_output_buffer: Buffer,
+    config_buffer: Buffer,
+    status_buffer: Buffer,
+    status_staging: Buffer,
+    payload_size: u64,
+    block_info_size: u64,
+    output_size_bytes: u64,
+    config_size: u64,
+    status_size: u64,
+    status_readback_size: u64,
+    payload_usage: BufferUsages,
+    block_info_usage: BufferUsages,
+    output_usage: BufferUsages,
+    staging_output_usage: BufferUsages,
+    config_usage: BufferUsages,
+    status_usage: BufferUsages,
+    status_readback_usage: BufferUsages,
+}
+
+impl DispatchBuffers {
+    fn return_to_pool(self, pool: &mut GPUMemoryPool) {
+        pool.return_buffer(self.payload_buffer, self.payload_size, self.payload_usage);
+        pool.return_buffer(
+            self.block_info_buffer,
+            self.block_info_size,
+            self.block_info_usage,
+        );
+        pool.return_buffer(
+            self.output_buffer,
+            self.output_size_bytes,
+            self.output_usage,
+        );
+        pool.return_buffer(
+            self.staging_output_buffer,
+            self.output_size_bytes,
+            self.staging_output_usage,
+        );
+        pool.return_buffer(self.config_buffer, self.config_size, self.config_usage);
+        pool.return_buffer(self.status_buffer, self.status_size, self.status_usage);
+        pool.return_buffer(
+            self.status_staging,
+            self.status_readback_size,
+            self.status_readback_usage,
+        );
+    }
 }
 
 impl GPUDevice {
@@ -118,7 +173,7 @@ impl GPUDevice {
                 &DeviceDescriptor {
                     label: Some("GPU Device"),
                     required_features: Features::empty(),
-                    required_limits: limits,
+                    required_limits: limits.clone(),
                 },
                 None,
             )
@@ -145,6 +200,8 @@ impl GPUDevice {
             queue: Arc::new(queue),
             compute_pipeline: Arc::new(compute_pipeline),
             memory_pool,
+            adapter_info,
+            adapter_limits: limits,
         };
 
         // Don't store in global singleton since wgpu::Device isn't Clone, and we can't both store in static
@@ -170,15 +227,95 @@ impl GPUDecompressor {
         result
     }
 
+    /// Decompress the entire frame and stream the output directly to a writer without holding it all in RAM.
+    pub async fn decompress_to_writer<W: Write + Send>(
+        &self,
+        frame: &LZ4CompressedFrame,
+        writer: &mut W,
+    ) -> Result<()> {
+        self.decompress_with_options_to_writer(frame, None, writer)
+            .await
+    }
+
+    /// Stream decompressed output block-by-block to a writer to avoid holding the full output in RAM.
+    pub async fn decompress_streaming_to_writer<W: Write + Send>(
+        &self,
+        frame: &LZ4CompressedFrame,
+        writer: &mut W,
+    ) -> Result<()> {
+        for block in &frame.blocks {
+            let start = block.compressed_offset as usize;
+            let end = start + block.compressed_size as usize;
+            let block_slice = &frame.payload[start..end];
+
+            let block_frame = LZ4CompressedFrame {
+                uncompressed_size: block.uncompressed_size as usize,
+                block_size: frame.block_size,
+                blocks: vec![LZ4BlockDescriptor {
+                    compressed_size: block.compressed_size,
+                    uncompressed_size: block.uncompressed_size,
+                    compressed_offset: 0,
+                    output_offset: 0,
+                    is_compressed: block.is_compressed,
+                }],
+                payload: Arc::from(block_slice.to_vec()),
+                total_compressed_bytes: block_slice.len(),
+                reported_content_size: Some(block.uncompressed_size as usize),
+                uses_block_checksum: frame.uses_block_checksum,
+            };
+
+            let bytes = self.decompress(&block_frame).await?;
+            writer.write_all(&bytes)?;
+        }
+        Ok(())
+    }
+
     /// Decompress with optional direct I/O path for unified memory systems
     pub async fn decompress_with_options(
         &self,
         frame: &LZ4CompressedFrame,
         _direct_io_path: Option<&str>,
     ) -> Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(frame.uncompressed_size);
+        self.decompress_with_options_to_writer(frame, _direct_io_path, &mut output)
+            .await?;
+        Ok(output)
+    }
+
+    async fn decompress_with_options_to_writer<W: Write + Send>(
+        &self,
+        frame: &LZ4CompressedFrame,
+        _direct_io_path: Option<&str>,
+        writer: &mut W,
+    ) -> Result<()> {
         let total_blocks = frame.blocks.len();
         if total_blocks == 0 {
-            return Ok(vec![]);
+            return Ok(());
+        }
+
+        // Optional GPU dispatch/profile info for visibility. Enable with FCF_GPU_PROFILE=1.
+        if std::env::var("FCF_GPU_PROFILE").is_ok() {
+            let wg_size: u32 = 1;
+            let num_groups = ((total_blocks as u32) + (wg_size - 1)) / wg_size;
+            println!(
+                "[gpu-profile] adapter={} ({:?}, {:?}), limits: max_workgroups_xyz={:?}, max_wg_size_xyz={:?}, max_total_wg_size={}, max_storage_buffer_binding_size={}, max_buffer_size={}",
+                self.device.adapter_info.name,
+                self.device.adapter_info.device_type,
+                self.device.adapter_info.backend,
+                self.device.adapter_limits.max_compute_workgroups_per_dimension,
+                [
+                    self.device.adapter_limits.max_compute_workgroup_size_x,
+                    self.device.adapter_limits.max_compute_workgroup_size_y,
+                    self.device.adapter_limits.max_compute_workgroup_size_z,
+                ],
+                self.device.adapter_limits.max_compute_invocations_per_workgroup,
+                self.device.adapter_limits.max_storage_buffer_binding_size,
+                self.device.adapter_limits.max_buffer_size,
+            );
+            println!(
+                "[gpu-profile] dispatch blocks={}, workgroup_size={}, workgroups={}x1x1",
+                total_blocks, wg_size, num_groups
+            );
         }
 
         let compressed_length: u32 = frame
@@ -187,9 +324,70 @@ impl GPUDecompressor {
             .try_into()
             .context("Compressed payload too large for GPU path")?;
 
-        // Prepare GPU data with padded offsets to avoid cross-block word sharing
-        let mut gpu_blocks: Vec<GPUBlockInfo> = Vec::with_capacity(total_blocks);
-        let mut padded_offsets: Vec<u64> = Vec::with_capacity(total_blocks);
+        let (gpu_blocks, padded_offsets, output_size_bytes, output_length) =
+            self.build_block_metadata(frame)?;
+        let buffers = self.prepare_dispatch_buffers(
+            frame,
+            compressed_length,
+            output_size_bytes,
+            output_length,
+            &gpu_blocks,
+        )?;
+
+        self.submit_dispatch(total_blocks, &buffers)?;
+
+        if let Some(err) = self.read_statuses(frame, &buffers).await? {
+            let mut pool = self.device.memory_pool.lock().unwrap();
+            buffers.return_to_pool(&mut pool);
+            return Err(err);
+        }
+
+        self.write_output_to_writer(frame, &padded_offsets, &buffers, writer)
+            .await?;
+
+        let mut pool = self.device.memory_pool.lock().unwrap();
+        buffers.return_to_pool(&mut pool);
+        Ok(())
+    }
+
+    /// Stream a file through the GPU in batches to avoid holding the entire compressed payload in memory.
+    pub async fn decompress_file_streaming_to_writer<W: Write + Send>(
+        &self,
+        path: &str,
+        writer: &mut W,
+        max_batch_blocks: usize,
+    ) -> Result<()> {
+        let mut stream = LZ4FrameStream::from_file(path, max_batch_blocks)?;
+        while let Some(frame) = stream.next_batch()? {
+            self.decompress_to_writer(&frame, writer).await?;
+        }
+        Ok(())
+    }
+
+    fn bytes_to_u32_array(bytes: &[u8]) -> Vec<u32> {
+        let mut result = Vec::with_capacity((bytes.len() + 3) / 4);
+        let mut i = 0;
+
+        while i < bytes.len() {
+            let mut word = 0u32;
+            for j in 0..4 {
+                if i + j < bytes.len() {
+                    word |= (bytes[i + j] as u32) << (j * 8);
+                }
+            }
+            result.push(word);
+            i += 4;
+        }
+
+        result
+    }
+
+    fn build_block_metadata(
+        &self,
+        frame: &LZ4CompressedFrame,
+    ) -> Result<(Vec<GPUBlockInfo>, Vec<u64>, u64, u32)> {
+        let mut gpu_blocks: Vec<GPUBlockInfo> = Vec::with_capacity(frame.blocks.len());
+        let mut padded_offsets: Vec<u64> = Vec::with_capacity(frame.blocks.len());
         let mut padded_cursor_words: u64 = 0;
 
         for block in &frame.blocks {
@@ -225,34 +423,38 @@ impl GPUDecompressor {
             .try_into()
             .context("Output size too large for GPU path")?;
 
+        Ok((gpu_blocks, padded_offsets, output_size_bytes, output_length))
+    }
+
+    fn prepare_dispatch_buffers(
+        &self,
+        frame: &LZ4CompressedFrame,
+        compressed_length: u32,
+        output_size_bytes: u64,
+        output_length: u32,
+        gpu_blocks: &[GPUBlockInfo],
+    ) -> Result<DispatchBuffers> {
+        let total_blocks = frame.blocks.len();
         let config = KernelConfig {
             block_count: total_blocks as u32,
             compressed_length,
             output_length,
             _pad0: 0,
         };
-
-        // Status buffer initialized to zero so unwritten entries are treated as success.
         let status_init = vec![0u32; total_blocks];
 
-        // Convert byte data to u32 array for GPU
         let payload_u32 = Self::bytes_to_u32_array(&frame.payload);
-
-        // Use memory pool for buffers
         let payload_usage = BufferUsages::STORAGE | BufferUsages::COPY_DST;
         let payload_size =
             ((payload_u32.len() as u64) * (std::mem::size_of::<u32>() as u64)).max(1);
         let payload_buffer = {
             let mut pool = self.device.memory_pool.lock().unwrap();
             let buffer = if let Some(pool_buffer) = pool.get_buffer(payload_size, payload_usage) {
-                // Got a buffer from the pool, reuse it
                 pool_buffer
             } else {
-                // Create a new buffer
                 pool.allocate_new_buffer(&*self.device.device, payload_size, payload_usage)
             };
 
-            // Write data to the buffer
             self.device
                 .queue
                 .write_buffer(&buffer, 0, bytemuck::cast_slice(&payload_u32));
@@ -271,10 +473,9 @@ impl GPUDecompressor {
                 pool.allocate_new_buffer(&*self.device.device, block_info_size, block_info_usage)
             };
 
-            // Write data to the buffer
             self.device
                 .queue
-                .write_buffer(&buffer, 0, bytemuck::cast_slice(&gpu_blocks));
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(gpu_blocks));
             buffer
         };
 
@@ -288,7 +489,6 @@ impl GPUDecompressor {
             }
         };
 
-        // Staging buffer for readback
         let staging_output_usage = BufferUsages::MAP_READ | BufferUsages::COPY_DST;
         let staging_output_buffer = {
             let mut pool = self.device.memory_pool.lock().unwrap();
@@ -313,7 +513,6 @@ impl GPUDecompressor {
                 pool.allocate_new_buffer(&*self.device.device, config_size, config_usage)
             };
 
-            // Write data to the buffer
             self.device
                 .queue
                 .write_buffer(&buffer, 0, bytemuck::cast_slice(&[config]));
@@ -331,84 +530,15 @@ impl GPUDecompressor {
                 pool.allocate_new_buffer(&*self.device.device, status_size, status_usage)
             };
 
-            // Initialize statuses to zero each dispatch to avoid stale failures.
             self.device
                 .queue
                 .write_buffer(&buffer, 0, bytemuck::cast_slice(&status_init));
-
             buffer
         };
 
-        // Bind group (use pipeline's layout to avoid mismatches)
-        let bgl0 = self.device.compute_pipeline.get_bind_group_layout(0);
-        let bind_group = self.device.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("LZ4 Bind Group"),
-            layout: &bgl0,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: payload_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: block_info_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: output_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: config_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: status_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Encode
-        let mut encoder = self
-            .device
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("LZ4 Decompression Encoder"),
-            });
-
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label: Some("LZ4 Decompression Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.device.compute_pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
-            // Dispatch exactly enough workgroups for @workgroup_size(1)
-            // Using 1 thread per block avoids wasting lanes when block counts are small.
-            let wg_size: u32 = 1;
-            let num_groups = ((total_blocks as u32) + (wg_size - 1)) / wg_size;
-            compute_pass.dispatch_workgroups(num_groups.max(1), 1, 1);
-        } // <- compute pass dropped here
-
-        // Copy GPU output to staging (must happen after the pass ends)
-        encoder.copy_buffer_to_buffer(
-            &output_buffer,
-            0,
-            &staging_output_buffer,
-            0,
-            output_size_bytes,
-        );
-
-        let command_buffer = encoder.finish();
-        self.device.queue.submit(std::iter::once(command_buffer));
-
-        // Wait for GPU to finish
-        self.device.device.poll(Maintain::Wait);
-
-        // Check per-block statuses before reading output to avoid propagating bad data.
-        let status_readback_size =
-            (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4);
         let status_readback_usage = BufferUsages::MAP_READ | BufferUsages::COPY_DST;
+        let status_readback_size = (status_init.len() as u64 * std::mem::size_of::<u32>() as u64)
+            .max(4);
         let status_staging = {
             let mut pool = self.device.memory_pool.lock().unwrap();
             if let Some(pool_buffer) =
@@ -424,70 +554,140 @@ impl GPUDecompressor {
             }
         };
 
-        // Copy statuses to staging for mapping.
+        Ok(DispatchBuffers {
+            payload_buffer,
+            block_info_buffer,
+            output_buffer,
+            staging_output_buffer,
+            config_buffer,
+            status_buffer,
+            status_staging,
+            payload_size,
+            block_info_size,
+            output_size_bytes,
+            config_size,
+            status_size,
+            status_readback_size,
+            payload_usage,
+            block_info_usage,
+            output_usage,
+            staging_output_usage,
+            config_usage,
+            status_usage,
+            status_readback_usage,
+        })
+    }
+
+    fn submit_dispatch(&self, total_blocks: usize, buffers: &DispatchBuffers) -> Result<()> {
+        let bgl0 = self.device.compute_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("LZ4 Bind Group"),
+            layout: &bgl0,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: buffers.payload_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: buffers.block_info_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: buffers.output_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: buffers.config_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: buffers.status_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("LZ4 Decompression Encoder"),
+            });
+
         {
-            let mut status_encoder = self
-                .device
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("Status Readback Encoder"),
-                });
-            status_encoder.copy_buffer_to_buffer(
-                &status_buffer,
-                0,
-                &status_staging,
-                0,
-                status_readback_size,
-            );
-            let status_cb = status_encoder.finish();
-            self.device.queue.submit(std::iter::once(status_cb));
+            let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("LZ4 Decompression Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.device.compute_pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            let wg_size: u32 = 1;
+            let num_groups = ((total_blocks as u32) + (wg_size - 1)) / wg_size;
+            compute_pass.dispatch_workgroups(num_groups.max(1), 1, 1);
         }
 
-        let gpu_error = {
-            let status_slice = status_staging.slice(..);
-            let (status_tx, status_rx) = futures_intrusive::channel::shared::oneshot_channel();
-            status_slice.map_async(MapMode::Read, move |res| {
-                let _ = status_tx.send(res);
-            });
-            self.device.device.poll(Maintain::Wait);
-            let _ = status_rx
-                .receive()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("Failed to receive status buffer map"))??;
+        encoder.copy_buffer_to_buffer(
+            &buffers.output_buffer,
+            0,
+            &buffers.staging_output_buffer,
+            0,
+            buffers.output_size_bytes,
+        );
 
-            let status_data = status_slice.get_mapped_range();
-            let mut gpu_error: Option<(usize, u32)> = None;
-            for (idx, chunk) in status_data.chunks(4).enumerate() {
-                let val = u32::from_le_bytes(chunk.try_into().unwrap());
-                if val != 0 {
-                    gpu_error = Some((idx, val));
-                    break;
-                }
+        let command_buffer = encoder.finish();
+        self.device.queue.submit(std::iter::once(command_buffer));
+        self.device.device.poll(Maintain::Wait);
+        Ok(())
+    }
+
+    async fn read_statuses(
+        &self,
+        frame: &LZ4CompressedFrame,
+        buffers: &DispatchBuffers,
+    ) -> Result<Option<anyhow::Error>> {
+        let mut status_encoder = self
+            .device
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Status Readback Encoder"),
+            });
+        status_encoder.copy_buffer_to_buffer(
+            &buffers.status_buffer,
+            0,
+            &buffers.status_staging,
+            0,
+            buffers.status_readback_size,
+        );
+        let status_cb = status_encoder.finish();
+        self.device.queue.submit(std::iter::once(status_cb));
+
+        let status_slice = buffers.status_staging.slice(..);
+        let (status_tx, status_rx) = futures_intrusive::channel::shared::oneshot_channel();
+        status_slice.map_async(MapMode::Read, move |res| {
+            let _ = status_tx.send(res);
+        });
+        self.device.device.poll(Maintain::Wait);
+        let _ = status_rx
+            .receive()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Failed to receive status buffer map"))??;
+
+        let status_data = status_slice.get_mapped_range();
+        let mut gpu_error: Option<(usize, u32)> = None;
+        for (idx, chunk) in status_data.chunks(4).enumerate() {
+            let val = u32::from_le_bytes(chunk.try_into().unwrap());
+            if val != 0 {
+                gpu_error = Some((idx, val));
+                break;
             }
-            drop(status_data);
-            let _ = status_slice;
-            status_staging.unmap();
-            gpu_error
-        };
+        }
+        drop(status_data);
+        let _ = status_slice;
+        buffers.status_staging.unmap();
 
         if let Some((idx, packed)) = gpu_error {
             let code = packed & 0xFF;
             let detail = packed >> 8;
-            // Return buffers to the pool before bailing so we don't leak GPU memory.
-            let mut pool = self.device.memory_pool.lock().unwrap();
-            pool.return_buffer(payload_buffer, payload_size, payload_usage);
-            pool.return_buffer(block_info_buffer, block_info_size, block_info_usage);
-            pool.return_buffer(output_buffer, output_size_bytes, output_usage);
-            pool.return_buffer(
-                staging_output_buffer,
-                output_size_bytes,
-                staging_output_usage,
-            );
-            pool.return_buffer(config_buffer, config_size, config_usage);
-            pool.return_buffer(status_buffer, status_size, status_usage);
-            pool.return_buffer(status_staging, status_readback_size, status_readback_usage);
-
-            // Provide extra context about the failing block to aid debugging.
             let block_debug = frame.blocks.get(idx).map(|b| {
                 let start = b.compressed_offset as usize;
                 let end = start.saturating_add(b.compressed_size as usize).min(frame.payload.len());
@@ -506,7 +706,7 @@ impl GPUDecompressor {
                 )
             });
 
-            return Err(anyhow::anyhow!(
+            let err = anyhow::anyhow!(
                 "GPU decompression failed for block {} (status code {}, detail {}){}",
                 idx,
                 code,
@@ -515,18 +715,26 @@ impl GPUDecompressor {
                     .as_ref()
                     .map(|s| format!(", block={}", s))
                     .unwrap_or_default()
-            ));
+            );
+            return Ok(Some(err));
         }
 
-        // Read back from staging buffer
-        let buffer_slice = staging_output_buffer.slice(..);
+        Ok(None)
+    }
+
+    async fn write_output_to_writer<W: Write + Send>(
+        &self,
+        frame: &LZ4CompressedFrame,
+        padded_offsets: &[u64],
+        buffers: &DispatchBuffers,
+        writer: &mut W,
+    ) -> Result<()> {
+        let buffer_slice = buffers.staging_output_buffer.slice(..);
         let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
         buffer_slice.map_async(MapMode::Read, move |res| {
             let _ = sender.send(res);
         });
 
-        // Drive the mapping to completion; without an explicit poll the callback
-        // never fires and the async receive below hangs.
         self.device.device.poll(Maintain::Wait);
 
         let _map_result = receiver
@@ -535,67 +743,15 @@ impl GPUDecompressor {
             .ok_or_else(|| anyhow::anyhow!("Failed to receive buffer"))??;
 
         let data = buffer_slice.get_mapped_range();
-        let mut bytes = vec![0u8; frame.uncompressed_size];
         for (idx, block) in frame.blocks.iter().enumerate() {
             let padded_offset = padded_offsets[idx] as usize;
             let start = padded_offset;
             let end = start + block.uncompressed_size as usize;
-            let output_start = block.output_offset as usize;
-            let output_end = output_start + block.uncompressed_size as usize;
-
-            bytes[output_start..output_end].copy_from_slice(&data[start..end]);
+            writer.write_all(&data[start..end])?;
         }
         drop(data);
-        staging_output_buffer.unmap(); // Unmap before returning to pool
-
-        // Return buffers to pool after they're no longer needed
-        {
-            let mut pool = self.device.memory_pool.lock().unwrap();
-
-            // Return buffers to pool for reuse
-            pool.return_buffer(payload_buffer, payload_size, payload_usage);
-
-            pool.return_buffer(block_info_buffer, block_info_size, block_info_usage);
-
-            pool.return_buffer(output_buffer, output_size_bytes, output_usage);
-
-            pool.return_buffer(
-                staging_output_buffer,
-                output_size_bytes,
-                staging_output_usage,
-            );
-
-            pool.return_buffer(
-                config_buffer,
-                config_size,
-                config_usage,
-            );
-            pool.return_buffer(status_buffer, status_size, status_usage);
-            pool.return_buffer(
-                status_staging,
-                status_readback_size,
-                status_readback_usage,
-            );
-        }
-
-        Ok(bytes)
-    }
-    fn bytes_to_u32_array(bytes: &[u8]) -> Vec<u32> {
-        let mut result = Vec::with_capacity((bytes.len() + 3) / 4);
-        let mut i = 0;
-
-        while i < bytes.len() {
-            let mut word = 0u32;
-            for j in 0..4 {
-                if i + j < bytes.len() {
-                    word |= (bytes[i + j] as u32) << (j * 8);
-                }
-            }
-            result.push(word);
-            i += 4;
-        }
-
-        result
+        buffers.staging_output_buffer.unmap();
+        Ok(())
     }
 }
 

@@ -2,18 +2,17 @@ use anyhow::Result;
 
 pub mod async_pipeline;
 pub mod gpu;
-pub mod hybrid;
 pub mod lz4;
 pub mod lz4_parser;
 pub mod memory_pool;
-pub mod resource_management;
 pub mod simple_profiler;
 pub mod streaming_pipeline;
 
 // Re-export main types
 pub use gpu::{GPUDecompressor, GPUDevice};
 pub use lz4::{LZ4BlockDescriptor, LZ4CompressedFrame, LZ4Decompressor};
-pub use lz4_parser::{LZ4FrameParser, ParsedFrame};
+pub use lz4_parser::{LZ4FrameParser, LZ4FrameStream, ParsedFrame};
+pub use streaming_pipeline::{StreamingConfig, StreamingPipeline};
 
 /// Main decompressor that can use both CPU and GPU backends
 pub struct Decompressor {
@@ -49,6 +48,28 @@ impl Decompressor {
     pub async fn decompress_gpu(&self, frame: &LZ4CompressedFrame) -> Result<Vec<u8>> {
         match &self.gpu_decompressor {
             Some(gpu) => gpu.decompress(frame).await,
+            None => Err(anyhow::anyhow!("GPU decompressor not available")),
+        }
+    }
+
+    pub async fn decompress_gpu_to_writer<W: std::io::Write + Send>(
+        &self,
+        frame: &LZ4CompressedFrame,
+        writer: &mut W,
+    ) -> Result<()> {
+        match &self.gpu_decompressor {
+            Some(gpu) => gpu.decompress_to_writer(frame, writer).await,
+            None => Err(anyhow::anyhow!("GPU decompressor not available")),
+        }
+    }
+
+    pub async fn decompress_gpu_streaming<W: std::io::Write + Send>(
+        &self,
+        frame: &LZ4CompressedFrame,
+        writer: &mut W,
+    ) -> Result<()> {
+        match &self.gpu_decompressor {
+            Some(gpu) => gpu.decompress_streaming_to_writer(frame, writer).await,
             None => Err(anyhow::anyhow!("GPU decompressor not available")),
         }
     }
