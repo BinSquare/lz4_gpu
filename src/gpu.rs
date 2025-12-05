@@ -1,6 +1,5 @@
 use crate::lz4::LZ4CompressedFrame;
 use crate::memory_pool::GPUMemoryPool;
-use crate::persistent_gpu::GPUContextManager;
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -59,8 +58,6 @@ pub struct GPUDevice {
     queue: Arc<Queue>,
     compute_pipeline: Arc<ComputePipeline>,
     memory_pool: Arc<Mutex<GPUMemoryPool>>,
-    context_manager: Arc<Mutex<GPUContextManager>>,
-    persistent_context: Option<Arc<Mutex<crate::persistent_gpu::PersistentGPUContext>>>,
 }
 
 #[derive(Clone)]
@@ -142,16 +139,12 @@ impl GPUDevice {
 
         // Create memory pool - buffers will be created with proper size and usage hints
         let memory_pool = Arc::new(Mutex::new(GPUMemoryPool::new()));
-        let context_manager = Arc::new(Mutex::new(crate::persistent_gpu::GPUContextManager::new()));
-        let persistent_context = None; // Will be initialized lazily when needed
 
         let gpu_device = Self {
             device: Arc::new(device),
             queue: Arc::new(queue),
             compute_pipeline: Arc::new(compute_pipeline),
             memory_pool,
-            context_manager,
-            persistent_context,
         };
 
         // Don't store in global singleton since wgpu::Device isn't Clone, and we can't both store in static
@@ -161,28 +154,6 @@ impl GPUDevice {
         Ok(gpu_device)
     }
 
-    /// Try to acquire a persistent GPU context guard
-    fn try_acquire_persistent_context(&self) -> Option<PersistentContextGuard> {
-        // Try to acquire a persistent GPU context for reduced setup overhead
-        if let Some(ref _persistent_ctx) = self.persistent_context {
-            // Attempt to acquire the persistent context
-            // In a full implementation, this would actually acquire a context
-            // For now, we'll just indicate that a persistent context is available
-            Some(PersistentContextGuard)
-        } else {
-            // No persistent context available
-            None
-        }
-    }
-}
-
-/// Guard for holding persistent GPU context
-struct PersistentContextGuard;
-
-impl Drop for PersistentContextGuard {
-    fn drop(&mut self) {
-        // Release the persistent context when guard goes out of scope
-    }
 }
 
 impl GPUDecompressor {
@@ -194,15 +165,7 @@ impl GPUDecompressor {
     }
 
     pub async fn decompress(&self, frame: &LZ4CompressedFrame) -> Result<Vec<u8>> {
-        // Use persistent GPU context when available for reduced setup overhead
         let result = self.decompress_with_options(frame, None).await;
-
-        // Mark GPU context as recently used
-        {
-            let _manager = self.device.context_manager.lock().unwrap();
-            // In a real implementation, we'd update the context's last_used timestamp
-            // This is a placeholder for keeping the GPU context warm
-        }
 
         result
     }
@@ -213,8 +176,6 @@ impl GPUDecompressor {
         frame: &LZ4CompressedFrame,
         _direct_io_path: Option<&str>,
     ) -> Result<Vec<u8>> {
-        // Try to use persistent GPU context for reduced setup overhead
-        let _persistent_guard = self.device.try_acquire_persistent_context();
         let total_blocks = frame.blocks.len();
         if total_blocks == 0 {
             return Ok(vec![]);
@@ -278,21 +239,17 @@ impl GPUDecompressor {
         let payload_u32 = Self::bytes_to_u32_array(&frame.payload);
 
         // Use memory pool for buffers
+        let payload_usage = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        let payload_size =
+            ((payload_u32.len() as u64) * (std::mem::size_of::<u32>() as u64)).max(1);
         let payload_buffer = {
             let mut pool = self.device.memory_pool.lock().unwrap();
-            let buffer = if let Some(pool_buffer) = pool.get_buffer(
-                ((payload_u32.len() as u64) * (std::mem::size_of::<u32>() as u64)).max(1),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            ) {
+            let buffer = if let Some(pool_buffer) = pool.get_buffer(payload_size, payload_usage) {
                 // Got a buffer from the pool, reuse it
                 pool_buffer
             } else {
                 // Create a new buffer
-                pool.allocate_new_buffer(
-                    &*self.device.device,
-                    ((payload_u32.len() as u64) * (std::mem::size_of::<u32>() as u64)).max(1),
-                    BufferUsages::STORAGE | BufferUsages::COPY_DST,
-                )
+                pool.allocate_new_buffer(&*self.device.device, payload_size, payload_usage)
             };
 
             // Write data to the buffer
@@ -302,20 +259,16 @@ impl GPUDecompressor {
             buffer
         };
 
+        let block_info_usage = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        let block_info_size =
+            ((gpu_blocks.len() as u64) * (std::mem::size_of::<GPUBlockInfo>() as u64)).max(1);
         let block_info_buffer = {
             let mut pool = self.device.memory_pool.lock().unwrap();
-            let buffer = if let Some(pool_buffer) = pool.get_buffer(
-                ((gpu_blocks.len() as u64) * (std::mem::size_of::<GPUBlockInfo>() as u64)).max(1),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            ) {
+            let buffer = if let Some(pool_buffer) = pool.get_buffer(block_info_size, block_info_usage)
+            {
                 pool_buffer
             } else {
-                pool.allocate_new_buffer(
-                    &*self.device.device,
-                    ((gpu_blocks.len() as u64) * (std::mem::size_of::<GPUBlockInfo>() as u64))
-                        .max(1),
-                    BufferUsages::STORAGE | BufferUsages::COPY_DST,
-                )
+                pool.allocate_new_buffer(&*self.device.device, block_info_size, block_info_usage)
             };
 
             // Write data to the buffer
@@ -325,52 +278,39 @@ impl GPUDecompressor {
             buffer
         };
 
+        let output_usage = BufferUsages::STORAGE | BufferUsages::COPY_SRC;
         let output_buffer = {
             let mut pool = self.device.memory_pool.lock().unwrap();
-            if let Some(pool_buffer) = pool.get_buffer(
-                output_size_bytes,
-                BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            ) {
+            if let Some(pool_buffer) = pool.get_buffer(output_size_bytes, output_usage) {
                 pool_buffer
             } else {
-                pool.allocate_new_buffer(
-                    &*self.device.device,
-                    output_size_bytes,
-                    BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-                )
+                pool.allocate_new_buffer(&*self.device.device, output_size_bytes, output_usage)
             }
         };
 
         // Staging buffer for readback
+        let staging_output_usage = BufferUsages::MAP_READ | BufferUsages::COPY_DST;
         let staging_output_buffer = {
             let mut pool = self.device.memory_pool.lock().unwrap();
-            if let Some(pool_buffer) = pool.get_buffer(
-                output_size_bytes,
-                BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            ) {
+            if let Some(pool_buffer) = pool.get_buffer(output_size_bytes, staging_output_usage) {
                 pool_buffer
             } else {
                 pool.allocate_new_buffer(
                     &*self.device.device,
                     output_size_bytes,
-                    BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                    staging_output_usage,
                 )
             }
         };
 
+        let config_usage = BufferUsages::UNIFORM | BufferUsages::COPY_DST;
+        let config_size = std::mem::size_of::<KernelConfig>() as u64;
         let config_buffer = {
             let mut pool = self.device.memory_pool.lock().unwrap();
-            let buffer = if let Some(pool_buffer) = pool.get_buffer(
-                std::mem::size_of::<KernelConfig>() as u64,
-                BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            ) {
+            let buffer = if let Some(pool_buffer) = pool.get_buffer(config_size, config_usage) {
                 pool_buffer
             } else {
-                pool.allocate_new_buffer(
-                    &*self.device.device,
-                    std::mem::size_of::<KernelConfig>() as u64,
-                    BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                )
+                pool.allocate_new_buffer(&*self.device.device, config_size, config_usage)
             };
 
             // Write data to the buffer
@@ -380,19 +320,15 @@ impl GPUDecompressor {
             buffer
         };
 
+        let status_usage =
+            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
+        let status_size = (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4);
         let status_buffer = {
             let mut pool = self.device.memory_pool.lock().unwrap();
-            let buffer = if let Some(pool_buffer) = pool.get_buffer(
-                (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
-            ) {
+            let buffer = if let Some(pool_buffer) = pool.get_buffer(status_size, status_usage) {
                 pool_buffer
             } else {
-                pool.allocate_new_buffer(
-                    &*self.device.device,
-                    (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4),
-                    BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
-                )
+                pool.allocate_new_buffer(&*self.device.device, status_size, status_usage)
             };
 
             // Initialize statuses to zero each dispatch to avoid stale failures.
@@ -472,17 +408,18 @@ impl GPUDecompressor {
         // Check per-block statuses before reading output to avoid propagating bad data.
         let status_readback_size =
             (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4);
+        let status_readback_usage = BufferUsages::MAP_READ | BufferUsages::COPY_DST;
         let status_staging = {
             let mut pool = self.device.memory_pool.lock().unwrap();
             if let Some(pool_buffer) =
-                pool.get_buffer(status_readback_size, BufferUsages::MAP_READ | BufferUsages::COPY_DST)
+                pool.get_buffer(status_readback_size, status_readback_usage)
             {
                 pool_buffer
             } else {
                 pool.allocate_new_buffer(
                     &*self.device.device,
                     status_readback_size,
-                    BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                    status_readback_usage,
                 )
             }
         };
@@ -538,41 +475,17 @@ impl GPUDecompressor {
             let detail = packed >> 8;
             // Return buffers to the pool before bailing so we don't leak GPU memory.
             let mut pool = self.device.memory_pool.lock().unwrap();
-            pool.return_buffer(
-                payload_buffer,
-                ((payload_u32.len() as u64) * (std::mem::size_of::<u32>() as u64)).max(1),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            );
-            pool.return_buffer(
-                block_info_buffer,
-                ((gpu_blocks.len() as u64) * (std::mem::size_of::<GPUBlockInfo>() as u64)).max(1),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            );
-            pool.return_buffer(
-                output_buffer,
-                output_size_bytes,
-                BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            );
+            pool.return_buffer(payload_buffer, payload_size, payload_usage);
+            pool.return_buffer(block_info_buffer, block_info_size, block_info_usage);
+            pool.return_buffer(output_buffer, output_size_bytes, output_usage);
             pool.return_buffer(
                 staging_output_buffer,
                 output_size_bytes,
-                BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                staging_output_usage,
             );
-            pool.return_buffer(
-                config_buffer,
-                std::mem::size_of::<KernelConfig>() as u64,
-                BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            );
-            pool.return_buffer(
-                status_buffer,
-                (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
-            );
-            pool.return_buffer(
-                status_staging,
-                status_readback_size,
-                BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            );
+            pool.return_buffer(config_buffer, config_size, config_usage);
+            pool.return_buffer(status_buffer, status_size, status_usage);
+            pool.return_buffer(status_staging, status_readback_size, status_readback_usage);
 
             // Provide extra context about the failing block to aid debugging.
             let block_debug = frame.blocks.get(idx).map(|b| {
@@ -640,39 +553,28 @@ impl GPUDecompressor {
             let mut pool = self.device.memory_pool.lock().unwrap();
 
             // Return buffers to pool for reuse
-            pool.return_buffer(
-                payload_buffer,
-                ((payload_u32.len() as u64) * (std::mem::size_of::<u32>() as u64)).max(1),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            );
+            pool.return_buffer(payload_buffer, payload_size, payload_usage);
 
-            pool.return_buffer(
-                block_info_buffer,
-                ((gpu_blocks.len() as u64) * (std::mem::size_of::<GPUBlockInfo>() as u64)).max(1),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            );
+            pool.return_buffer(block_info_buffer, block_info_size, block_info_usage);
 
-            pool.return_buffer(
-                output_buffer,
-                output_size_bytes,
-                BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            );
+            pool.return_buffer(output_buffer, output_size_bytes, output_usage);
 
             pool.return_buffer(
                 staging_output_buffer,
                 output_size_bytes,
-                BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                staging_output_usage,
             );
 
             pool.return_buffer(
                 config_buffer,
-                std::mem::size_of::<KernelConfig>() as u64,
-                BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                config_size,
+                config_usage,
             );
+            pool.return_buffer(status_buffer, status_size, status_usage);
             pool.return_buffer(
-                status_buffer,
-                (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4),
-                BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                status_staging,
+                status_readback_size,
+                status_readback_usage,
             );
         }
 

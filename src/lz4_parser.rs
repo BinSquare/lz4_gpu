@@ -1,4 +1,3 @@
-use crate::direct_io::CrossPlatformIO;
 use crate::lz4::{LZ4BlockDescriptor, LZ4CompressedFrame, LZ4Error};
 use anyhow::{Context, Result};
 use lz4_flex::block::decompress_into;
@@ -30,14 +29,11 @@ impl LZ4FrameParser {
     }
 
     /// Parse file using direct I/O optimized for unified memory systems
-    /// This approach reduces unnecessary data copies on Apple M-series chips
+    /// This path mirrors `parse_file` but is kept for compatibility with callers that
+    /// expect a separate entry point. It currently performs a straightforward read.
     pub fn parse_file_direct_io(path: &str) -> Result<ParsedFrame> {
-        // Use optimized I/O for unified memory systems
-        let data = CrossPlatformIO::read_file_optimized(path)
-            .with_context(|| format!("Failed to read file with direct I/O: {}", path))?;
-
-        // Prepare data for GPU access (no-op on unified memory systems)
-        CrossPlatformIO::prepare_for_gpu(&data)?;
+        let data = std::fs::read(path)
+            .with_context(|| format!("Failed to read file: {}", path))?;
 
         let frame = Self::parse(&data)?;
         let file_size = data.len();
@@ -46,9 +42,6 @@ impl LZ4FrameParser {
             .and_then(|name| name.to_str())
             .unwrap_or("unknown")
             .to_string();
-
-        // Hint about access patterns for better performance
-        CrossPlatformIO::hint_gpu_access_pattern(&data)?;
 
         Ok(ParsedFrame {
             frame,
