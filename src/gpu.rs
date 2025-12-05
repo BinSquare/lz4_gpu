@@ -54,7 +54,6 @@ pub struct KernelConfig {
     pub _pad0: u32, // size = 16
 }
 
-#[derive(Clone)]
 pub struct GPUDevice {
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -222,9 +221,11 @@ impl GPUDecompressor {
     }
 
     pub async fn decompress(&self, frame: &LZ4CompressedFrame) -> Result<Vec<u8>> {
-        let result = self.decompress_with_options(frame, None).await;
-
-        result
+        let frame = frame.clone();
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || pollster::block_on(this.decompress_with_options(&frame, None)))
+            .await
+            .map_err(|e| anyhow::anyhow!("GPU task join error: {e}"))?
     }
 
     /// Decompress the entire frame and stream the output directly to a writer without holding it all in RAM.
@@ -288,7 +289,7 @@ impl GPUDecompressor {
         let mut padded_cursor_words: u64 = 0;
 
         for block in &frame.blocks {
-            let _padded_offset_bytes = padded_cursor_words
+            padded_cursor_words
                 .checked_mul(4)
                 .context("Padded output offset overflow")?;
             let padded_block_words = ((block.uncompressed_size as u64) + 3) / 4;
@@ -323,7 +324,6 @@ impl GPUDecompressor {
                 current_payload.clear();
                 current_uncompressed = 0;
                 output_cursor = 0;
-                padded_cursor_words = 0;
             }
 
             let offset_in_batch = current_payload.len() as u64;
@@ -515,10 +515,10 @@ impl GPUDecompressor {
 
             gpu_blocks.push(GPUBlockInfo {
                 compressed_offset: u32::try_from(block.compressed_offset)
-                    .context("GPU path only supports per-batch compressed offsets up to 4GiB")?,
+                    .context("GPU path only supports per-batch compressed offsets up to 4GiB; reduce batch size")?,
                 compressed_size: block.compressed_size,
                 output_offset: u32::try_from(padded_offset_bytes)
-                    .context("Padded output offset too large for GPU path")?,
+                    .context("Padded output offset too large for GPU path; reduce batch size")?,
                 output_size: block.uncompressed_size,
                 is_compressed: if block.is_compressed { 1 } else { 0 },
                 _pad0: 0,

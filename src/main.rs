@@ -170,7 +170,13 @@ async fn run_compare(
 
     if decompressor.has_gpu() && !args.disable_gpu {
         let gpu_start = Instant::now();
-        let gpu_result = decompressor.decompress_gpu(&parsed.frame).await?;
+        let mut gpu_result = Vec::new();
+        for batch in files_can_fly_rust::GPUDecompressor::split_frame_for_gpu(
+            &parsed.frame,
+            args.gpu_batch_bytes,
+        )? {
+            gpu_result.extend_from_slice(&decompressor.decompress_gpu(&batch).await?);
+        }
         let gpu_duration = gpu_start.elapsed();
         println!("GPU result size: {}", gpu_result.len());
         println!("GPU decompression time: {:.2?}", gpu_duration);
@@ -206,16 +212,15 @@ async fn run_profile(
 
     if !args.disable_gpu && decompressor.has_gpu() {
         let start = Instant::now();
-        match decompressor.decompress_gpu(&parsed.frame).await {
-            Ok(data) => {
-                println!("GPU decompression completed in: {:.2?}", start.elapsed());
-                write_output(&data, args.output.as_deref())?;
-            }
-            Err(e) => {
-                eprintln!("⚠️  GPU path failed: {e}");
-                return Err(e);
-            }
+        let mut data = Vec::new();
+        for batch in files_can_fly_rust::GPUDecompressor::split_frame_for_gpu(
+            &parsed.frame,
+            args.gpu_batch_bytes,
+        )? {
+            data.extend_from_slice(&decompressor.decompress_gpu(&batch).await?);
         }
+        println!("GPU decompression completed in: {:.2?}", start.elapsed());
+        write_output(&data, args.output.as_deref())?;
     } else {
         let concurrency = args.cpu_threads.unwrap_or(num_cpus::get());
         let start = Instant::now();
