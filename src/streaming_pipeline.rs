@@ -114,7 +114,10 @@ impl StreamingPipeline {
     fn split_frames_by_size(
         &self,
         frames: Vec<LZ4CompressedFrame>,
-    ) -> (Vec<(usize, LZ4CompressedFrame)>, Vec<(usize, LZ4CompressedFrame)>) {
+    ) -> (
+        Vec<(usize, LZ4CompressedFrame)>,
+        Vec<(usize, LZ4CompressedFrame)>,
+    ) {
         let mut small_frames = Vec::new();
         let mut large_frames = Vec::new();
 

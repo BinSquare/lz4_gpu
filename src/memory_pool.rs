@@ -118,14 +118,14 @@ impl GPUMemoryPool {
     }
 }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        #[test]
-        fn test_memory_pool() {
-            let mut pool = GPUMemoryPool::new();
-            assert!(pool.get_buffer(1024, BufferUsages::MAP_READ).is_none());
-            pool.trim();
-        }
+    #[test]
+    fn test_memory_pool() {
+        let mut pool = GPUMemoryPool::new();
+        assert!(pool.get_buffer(1024, BufferUsages::MAP_READ).is_none());
+        pool.trim();
     }
+}

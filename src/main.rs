@@ -1,15 +1,15 @@
+use anyhow::anyhow;
 use anyhow::{Context, Result};
 use clap::Parser;
-use files_can_fly_rust::Decompressor;
-use files_can_fly_rust::lz4::LZ4Error;
-use anyhow::anyhow;
+use lz4_gpu::lz4::LZ4Error;
+use lz4_gpu::Decompressor;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "files-can-fly-rust")]
-#[command(about = "High-performance LZ4 decompression tool")]
+#[command(name = "lz4_gpu")]
+#[command(about = "High-performance LZ4 GPU decompression tool")]
 struct Args {
     /// Input LZ4 file to decompress
     #[arg(value_name = "INPUT_FILE")]
@@ -44,6 +44,15 @@ struct Args {
     compare: bool,
 }
 
+fn effective_gpu_batch_bytes(decompressor: &Decompressor, args: &Args) -> usize {
+    let adapter_limit = decompressor
+        .get_gpu_decompressor()
+        .map(|gpu| gpu.max_batch_bytes());
+    adapter_limit
+        .map(|limit| limit.min(args.gpu_batch_bytes))
+        .unwrap_or(args.gpu_batch_bytes)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -60,14 +69,16 @@ async fn main() -> Result<()> {
     print_banner(&input_path);
 
     if args.output.is_none() && !args.compare && !args.profile {
-        eprintln!("No output specified. Use -o/--output <FILE> or -o - to write decompressed data.");
+        eprintln!(
+            "No output specified. Use -o/--output <FILE> or -o - to write decompressed data."
+        );
         return Ok(());
     }
 
     let decompressor = Decompressor::new()?;
     log_gpu_status(&decompressor, args.disable_gpu);
 
-    let mut parsed: Option<files_can_fly_rust::ParsedFrame> = None;
+    let mut parsed: Option<lz4_gpu::ParsedFrame> = None;
 
     if args.compare && !args.disable_gpu && decompressor.has_gpu() {
         run_compare(&decompressor, &input_path, &mut parsed, &args).await?;
@@ -81,8 +92,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_with_hint(path: &str) -> Result<files_can_fly_rust::ParsedFrame> {
-    match files_can_fly_rust::LZ4FrameParser::parse_file_direct_io(path) {
+fn parse_with_hint(path: &str) -> Result<lz4_gpu::ParsedFrame> {
+    match lz4_gpu::LZ4FrameParser::parse_file_direct_io(path) {
         Ok(p) => Ok(p),
         Err(e) => {
             if let Some(LZ4Error::UnsupportedFrame(msg)) = e.downcast_ref::<LZ4Error>() {
@@ -104,9 +115,9 @@ fn parse_with_hint(path: &str) -> Result<files_can_fly_rust::ParsedFrame> {
 }
 
 fn ensure_parsed_frame<'a>(
-    parsed: &'a mut Option<files_can_fly_rust::ParsedFrame>,
+    parsed: &'a mut Option<lz4_gpu::ParsedFrame>,
     path: &str,
-) -> Result<&'a files_can_fly_rust::ParsedFrame> {
+) -> Result<&'a lz4_gpu::ParsedFrame> {
     if parsed.is_none() {
         *parsed = Some(parse_with_hint(path)?);
     }
@@ -115,7 +126,7 @@ fn ensure_parsed_frame<'a>(
 
 fn print_usage() {
     println!("Lz4_gpu Rust - High-performance LZ4 decompression with GPU support");
-    println!("Usage: files-can-fly-rust [OPTIONS] <INPUT_FILE>");
+    println!("Usage: lz4_gpu [OPTIONS] <INPUT_FILE>");
     println!();
     println!("Arguments:");
     println!("  [INPUT_FILE]  LZ4 file to decompress");
@@ -130,7 +141,7 @@ fn print_usage() {
 }
 
 fn print_banner(input_path: &str) {
-    println!("🚀 FilesCanFly Rust Decompressor");
+    println!("🚀 lz4_gpu Rust Decompressor");
     println!("==================================");
     println!("Input: {}", input_path);
     if let Ok(meta) = std::fs::metadata(input_path) {
@@ -151,7 +162,7 @@ fn log_gpu_status(decompressor: &Decompressor, disable_gpu: bool) {
 async fn run_compare(
     decompressor: &Decompressor,
     input_path: &str,
-    parsed: &mut Option<files_can_fly_rust::ParsedFrame>,
+    parsed: &mut Option<lz4_gpu::ParsedFrame>,
     args: &Args,
 ) -> Result<()> {
     let parsed = ensure_parsed_frame(parsed, input_path)?;
@@ -169,12 +180,12 @@ async fn run_compare(
     println!("CPU decompression time: {:.2?}", cpu_duration);
 
     if decompressor.has_gpu() && !args.disable_gpu {
+        let batch_bytes = effective_gpu_batch_bytes(decompressor, args);
         let gpu_start = Instant::now();
         let mut gpu_result = Vec::new();
-        for batch in files_can_fly_rust::GPUDecompressor::split_frame_for_gpu(
-            &parsed.frame,
-            args.gpu_batch_bytes,
-        )? {
+        for batch in
+            lz4_gpu::GPUDecompressor::split_frame_for_gpu(&parsed.frame, batch_bytes)?
+        {
             gpu_result.extend_from_slice(&decompressor.decompress_gpu(&batch).await?);
         }
         let gpu_duration = gpu_start.elapsed();
@@ -199,7 +210,7 @@ async fn run_compare(
 async fn run_profile(
     decompressor: &Decompressor,
     input_path: &str,
-    parsed: &mut Option<files_can_fly_rust::ParsedFrame>,
+    parsed: &mut Option<lz4_gpu::ParsedFrame>,
     args: &Args,
 ) -> Result<()> {
     let parsed = ensure_parsed_frame(parsed, input_path)?;
@@ -211,12 +222,12 @@ async fn run_profile(
     println!("Profiling decompression performance...");
 
     if !args.disable_gpu && decompressor.has_gpu() {
+        let batch_bytes = effective_gpu_batch_bytes(decompressor, args);
         let start = Instant::now();
         let mut data = Vec::new();
-        for batch in files_can_fly_rust::GPUDecompressor::split_frame_for_gpu(
-            &parsed.frame,
-            args.gpu_batch_bytes,
-        )? {
+        for batch in
+            lz4_gpu::GPUDecompressor::split_frame_for_gpu(&parsed.frame, batch_bytes)?
+        {
             data.extend_from_slice(&decompressor.decompress_gpu(&batch).await?);
         }
         println!("GPU decompression completed in: {:.2?}", start.elapsed());
@@ -233,7 +244,7 @@ async fn run_profile(
 }
 
 async fn run_streaming(decompressor: &Decompressor, input_path: &str, args: &Args) -> Result<()> {
-    let mut stream = files_can_fly_rust::lz4_parser::LZ4FrameStream::from_file(
+    let mut stream = lz4_gpu::lz4_parser::LZ4FrameStream::from_file(
         input_path,
         args.gpu_batch_blocks,
     )?;
@@ -245,6 +256,7 @@ async fn run_streaming(decompressor: &Decompressor, input_path: &str, args: &Arg
 
     let use_gpu = !args.disable_gpu && decompressor.has_gpu();
     log_gpu_status(decompressor, args.disable_gpu);
+    let batch_bytes = effective_gpu_batch_bytes(decompressor, args);
 
     let mut writer: Box<dyn Write + Send> = match args.output.as_deref() {
         Some("-") => Box::new(BufWriter::new(std::io::stdout())),
@@ -261,10 +273,9 @@ async fn run_streaming(decompressor: &Decompressor, input_path: &str, args: &Arg
     while let Some(frame) = stream.next_batch()? {
         if use_gpu {
             // Split oversized batches further to keep per-dispatch payload/output <4GiB.
-            for subframe in files_can_fly_rust::GPUDecompressor::split_frame_for_gpu(
-                &frame,
-                args.gpu_batch_bytes,
-            )? {
+            for subframe in
+                lz4_gpu::GPUDecompressor::split_frame_for_gpu(&frame, batch_bytes)?
+            {
                 decompressor
                     .decompress_gpu_to_writer(&subframe, &mut writer)
                     .await?;

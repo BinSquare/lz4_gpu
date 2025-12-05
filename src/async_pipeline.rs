@@ -76,10 +76,7 @@ impl AsyncGPUProcessor {
         Ok(join_handles)
     }
 
-    async fn join_workers(
-        &self,
-        join_handles: Vec<tokio::task::JoinHandle<()>>,
-    ) -> Result<()> {
+    async fn join_workers(&self, join_handles: Vec<tokio::task::JoinHandle<()>>) -> Result<()> {
         for handle in join_handles {
             handle.await?;
         }

@@ -1,4 +1,4 @@
-//! Simple performance profiling for lz4_gpu 
+//! Simple performance profiling for lz4_gpu
 //! This module provides simplified performance testing without complex GPU context management
 
 use std::collections::HashMap;

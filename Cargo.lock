@@ -372,29 +372,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
-name = "files-can-fly-rust"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "clap",
- "futures-intrusive",
- "libc",
- "lz4_flex",
- "num_cpus",
- "pollster",
- "rand",
- "rayon",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "wgpu",
- "xxhash-rust",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -709,6 +686,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08ab2867e3eeeca90e844d1940eab391c9dc5228783db2ed999acbc0a9ed375a"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "lz4_gpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "clap",
+ "futures-intrusive",
+ "libc",
+ "lz4_flex",
+ "num_cpus",
+ "pollster",
+ "rand",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "wgpu",
+ "xxhash-rust",
 ]
 
 [[package]]

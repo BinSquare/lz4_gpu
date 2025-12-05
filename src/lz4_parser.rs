@@ -39,7 +39,11 @@ impl LZ4FrameParser {
                 }
             }
 
-            if src.checked_add(literal_len).filter(|v| *v <= src_end).is_none() {
+            if src
+                .checked_add(literal_len)
+                .filter(|v| *v <= src_end)
+                .is_none()
+            {
                 return Err(LZ4Error::MalformedStream.into());
             }
             dst = dst
@@ -113,8 +117,7 @@ impl LZ4FrameParser {
     /// This path mirrors `parse_file` but is kept for compatibility with callers that
     /// expect a separate entry point. It currently performs a straightforward read.
     pub fn parse_file_direct_io(path: &str) -> Result<ParsedFrame> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("Failed to read file: {}", path))?;
+        let data = std::fs::read(path).with_context(|| format!("Failed to read file: {}", path))?;
 
         let frame = Self::parse(&data)?;
         let file_size = data.len();
@@ -535,8 +538,7 @@ impl<R: std::io::Read> LZ4FrameStream<R> {
         }
 
         let stored_header_checksum = Self::read_u8_reader(&mut reader)?;
-        let computed_header_checksum =
-            LZ4FrameParser::compute_header_checksum(&header_bytes);
+        let computed_header_checksum = LZ4FrameParser::compute_header_checksum(&header_bytes);
         if stored_header_checksum != computed_header_checksum {
             return Err(LZ4Error::ChecksumMismatch(format!(
                 "Header checksum mismatch (expected {:02X}, got {:02X})",
@@ -659,11 +661,7 @@ impl<R: std::io::Read> LZ4FrameStream<R> {
         Ok((block_data, is_compressed))
     }
 
-    fn validate_and_size_block(
-        &mut self,
-        block_data: &[u8],
-        is_compressed: bool,
-    ) -> Result<usize> {
+    fn validate_and_size_block(&mut self, block_data: &[u8], is_compressed: bool) -> Result<usize> {
         let size = if is_compressed {
             if self.content_checksum_flag {
                 let len = decompress_into(block_data, &mut self.scratch).map_err(|e| {
@@ -727,20 +725,19 @@ impl<R: std::io::Read> LZ4FrameStream<R> {
             .ok_or_else(|| anyhow::anyhow!("Total uncompressed size overflow"))?;
 
         if self.blocks_seen > MAX_BLOCKS {
-            return Err(LZ4Error::UnsupportedFrame(format!(
-                "Too many blocks (>{})",
-                MAX_BLOCKS
-            ))
-            .into());
+            return Err(
+                LZ4Error::UnsupportedFrame(format!("Too many blocks (>{})", MAX_BLOCKS)).into(),
+            );
         }
 
         Ok(())
     }
 
     fn finish_checks(&mut self) -> Result<()> {
-        if let Some(expected_checksum) = self.content_checksum_flag.then(|| {
-            Self::read_u32_reader(&mut self.reader)
-        }) {
+        if let Some(expected_checksum) = self
+            .content_checksum_flag
+            .then(|| Self::read_u32_reader(&mut self.reader))
+        {
             let expected_checksum = expected_checksum?;
             if let Some(hasher) = self.content_hasher.take() {
                 let actual = hasher.digest();

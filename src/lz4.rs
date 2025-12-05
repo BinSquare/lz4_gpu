@@ -89,7 +89,7 @@ impl LZ4Decompressor {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency)
             .build()
-                .map_err(|e| anyhow::anyhow!("Failed to build rayon thread pool: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to build rayon thread pool: {}", e))?;
 
         // Process blocks in parallel and collect individual results
         // This avoids the borrowing issue by creating separate output buffers

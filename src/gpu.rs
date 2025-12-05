@@ -209,10 +209,25 @@ impl GPUDevice {
         // Return the created device
         Ok(gpu_device)
     }
-
 }
 
 impl GPUDecompressor {
+    /// Compute a safe per-batch byte budget from adapter limits and shader word indexing.
+    pub fn max_batch_bytes(&self) -> usize {
+        let limits = &self.device.adapter_limits;
+        let storage_limit = limits.max_storage_buffer_binding_size as u64;
+        let buffer_limit = limits.max_buffer_size as u64;
+        let u32_limit = u32::MAX as u64;
+        let effective = storage_limit.min(buffer_limit).min(u32_limit);
+        // Round down to a 4-byte boundary to align with WGSL word indexing.
+        (effective & !3).clamp(4, usize::MAX as u64) as usize
+    }
+
+    fn align_to_word(bytes: u64) -> Result<u64> {
+        let rounded = (bytes.checked_add(3).context("Output size overflow")?) & !3;
+        Ok(rounded)
+    }
+
     pub fn new() -> Result<Self> {
         let device = pollster::block_on(GPUDevice::new())?;
         Ok(Self {
@@ -223,9 +238,11 @@ impl GPUDecompressor {
     pub async fn decompress(&self, frame: &LZ4CompressedFrame) -> Result<Vec<u8>> {
         let frame = frame.clone();
         let this = self.clone();
-        tokio::task::spawn_blocking(move || pollster::block_on(this.decompress_with_options(&frame, None)))
-            .await
-            .map_err(|e| anyhow::anyhow!("GPU task join error: {e}"))?
+        tokio::task::spawn_blocking(move || {
+            pollster::block_on(this.decompress_with_options(&frame, None))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("GPU task join error: {e}"))?
     }
 
     /// Decompress the entire frame and stream the output directly to a writer without holding it all in RAM.
@@ -286,31 +303,27 @@ impl GPUDecompressor {
         let mut current_payload = Vec::new();
         let mut current_uncompressed: usize = 0;
         let mut output_cursor: u64 = 0;
-        let mut padded_cursor_words: u64 = 0;
+        let mut padded_cursor_bytes: u64 = 0;
+
+        let limit = max_batch_bytes.max(4) as u64;
 
         for block in &frame.blocks {
-            padded_cursor_words
-                .checked_mul(4)
-                .context("Padded output offset overflow")?;
-            let padded_block_words = ((block.uncompressed_size as u64) + 3) / 4;
-            let new_padded_cursor = padded_cursor_words
-                .checked_add(padded_block_words)
-                .context("Padded output length overflow")?;
-
             let block_start = block.compressed_offset as usize;
             let block_end = block_start + block.compressed_size as usize;
             let block_bytes = &frame.payload[block_start..block_end];
+
+            let padded_block_bytes = Self::align_to_word(block.uncompressed_size as u64)
+                .context("Block padding overflow")?;
+            let mut padded_offset = Self::align_to_word(padded_cursor_bytes)?;
+            let mut new_padded_cursor = padded_offset
+                .checked_add(padded_block_bytes)
+                .context("Padded output length overflow")?;
 
             let new_payload_len = current_payload
                 .len()
                 .checked_add(block_bytes.len())
                 .ok_or_else(|| anyhow::anyhow!("Compressed payload size overflow"))?;
-            let new_output_bytes = new_padded_cursor
-                .checked_mul(4)
-                .ok_or_else(|| anyhow::anyhow!("Padded output length overflow"))?;
-
-            let would_exceed =
-                new_payload_len > max_batch_bytes || new_output_bytes > max_batch_bytes as u64;
+            let would_exceed = new_payload_len as u64 > limit || new_padded_cursor > limit;
 
             if would_exceed && !current_blocks.is_empty() {
                 batches.push(Self::make_subframe(
@@ -324,7 +337,12 @@ impl GPUDecompressor {
                 current_payload.clear();
                 current_uncompressed = 0;
                 output_cursor = 0;
+
+                padded_offset = 0;
+                new_padded_cursor = padded_block_bytes;
             }
+
+            debug_assert_eq!(padded_offset % 4, 0);
 
             let offset_in_batch = current_payload.len() as u64;
             current_payload.extend_from_slice(block_bytes);
@@ -339,7 +357,7 @@ impl GPUDecompressor {
             output_cursor = output_cursor
                 .checked_add(block.uncompressed_size as u64)
                 .ok_or_else(|| anyhow::anyhow!("Output offset overflow"))?;
-            padded_cursor_words = new_padded_cursor;
+            padded_cursor_bytes = new_padded_cursor;
             current_uncompressed = current_uncompressed
                 .checked_add(block.uncompressed_size as usize)
                 .ok_or_else(|| anyhow::anyhow!("Batch uncompressed overflow"))?;
@@ -394,6 +412,18 @@ impl GPUDecompressor {
         _direct_io_path: Option<&str>,
         writer: &mut W,
     ) -> Result<()> {
+        let batches = Self::split_frame_for_gpu(frame, self.max_batch_bytes())?;
+        for batch in batches {
+            self.decompress_single_batch_to_writer(&batch, writer).await?;
+        }
+        Ok(())
+    }
+
+    async fn decompress_single_batch_to_writer<W: Write + Send>(
+        &self,
+        frame: &LZ4CompressedFrame,
+        writer: &mut W,
+    ) -> Result<()> {
         let total_blocks = frame.blocks.len();
         if total_blocks == 0 {
             return Ok(());
@@ -440,7 +470,11 @@ impl GPUDecompressor {
             &gpu_blocks,
         )?;
 
-        self.submit_dispatch(total_blocks, &buffers)?;
+        if let Err(e) = self.submit_dispatch(total_blocks, &buffers).await {
+            let mut pool = self.device.memory_pool.lock().unwrap();
+            buffers.return_to_pool(&mut pool);
+            return Err(e);
+        }
 
         if let Some(err) = self.read_statuses(frame, &buffers).await? {
             let mut pool = self.device.memory_pool.lock().unwrap();
@@ -495,29 +529,38 @@ impl GPUDecompressor {
         result
     }
 
+    pub fn compute_padded_layout(blocks: &[LZ4BlockDescriptor]) -> Result<(Vec<u64>, u64)> {
+        let mut padded_offsets = Vec::with_capacity(blocks.len());
+        let mut padded_cursor: u64 = 0;
+        for block in blocks {
+            let padded_offset = Self::align_to_word(padded_cursor)?;
+            let padded_block = Self::align_to_word(block.uncompressed_size as u64)
+                .context("Block padding overflow")?;
+            padded_cursor = padded_offset
+                .checked_add(padded_block)
+                .context("Padded output length overflow")?;
+            debug_assert_eq!(padded_offset % 4, 0);
+            padded_offsets.push(padded_offset);
+        }
+        Ok((padded_offsets, padded_cursor.max(1)))
+    }
+
     fn build_block_metadata(
         &self,
         frame: &LZ4CompressedFrame,
     ) -> Result<(Vec<GPUBlockInfo>, Vec<u64>, u64, u32)> {
+        let (padded_offsets, output_size_bytes) = Self::compute_padded_layout(&frame.blocks)?;
         let mut gpu_blocks: Vec<GPUBlockInfo> = Vec::with_capacity(frame.blocks.len());
-        let mut padded_offsets: Vec<u64> = Vec::with_capacity(frame.blocks.len());
-        let mut padded_cursor_words: u64 = 0;
 
-        for block in &frame.blocks {
-            let padded_offset_bytes = padded_cursor_words
-                .checked_mul(4)
-                .context("Padded output offset overflow")?;
-
-            let padded_block_words = ((block.uncompressed_size as u64) + 3) / 4; // round up to word boundary
-            padded_cursor_words = padded_cursor_words
-                .checked_add(padded_block_words)
-                .context("Padded output length overflow")?;
+        for (block, padded_offset_bytes) in frame.blocks.iter().zip(padded_offsets.iter()) {
+            debug_assert_eq!(padded_offset_bytes % 4, 0);
+            debug_assert!(*padded_offset_bytes >= block.output_offset);
 
             gpu_blocks.push(GPUBlockInfo {
                 compressed_offset: u32::try_from(block.compressed_offset)
                     .context("GPU path only supports per-batch compressed offsets up to 4GiB; reduce batch size")?,
                 compressed_size: block.compressed_size,
-                output_offset: u32::try_from(padded_offset_bytes)
+                output_offset: u32::try_from(*padded_offset_bytes)
                     .context("Padded output offset too large for GPU path; reduce batch size")?,
                 output_size: block.uncompressed_size,
                 is_compressed: if block.is_compressed { 1 } else { 0 },
@@ -525,14 +568,8 @@ impl GPUDecompressor {
                 _pad1: 0,
                 _pad2: 0,
             });
-
-            padded_offsets.push(padded_offset_bytes);
         }
 
-        let output_size_bytes = padded_cursor_words
-            .checked_mul(4)
-            .context("Padded output length overflow")?
-            .max(1);
         let output_length: u32 = output_size_bytes
             .try_into()
             .context("GPU path does not support outputs larger than 4GiB")?;
@@ -580,7 +617,8 @@ impl GPUDecompressor {
             ((gpu_blocks.len() as u64) * (std::mem::size_of::<GPUBlockInfo>() as u64)).max(1);
         let block_info_buffer = {
             let mut pool = self.lock_pool()?;
-            let buffer = if let Some(pool_buffer) = pool.get_buffer(block_info_size, block_info_usage)
+            let buffer = if let Some(pool_buffer) =
+                pool.get_buffer(block_info_size, block_info_usage)
             {
                 pool_buffer
             } else {
@@ -633,8 +671,7 @@ impl GPUDecompressor {
             buffer
         };
 
-        let status_usage =
-            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
+        let status_usage = BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
         let status_size = (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4);
         let status_buffer = {
             let mut pool = self.lock_pool()?;
@@ -651,12 +688,11 @@ impl GPUDecompressor {
         };
 
         let status_readback_usage = BufferUsages::MAP_READ | BufferUsages::COPY_DST;
-        let status_readback_size = (status_init.len() as u64 * std::mem::size_of::<u32>() as u64)
-            .max(4);
+        let status_readback_size =
+            (status_init.len() as u64 * std::mem::size_of::<u32>() as u64).max(4);
         let status_staging = {
             let mut pool = self.lock_pool()?;
-            if let Some(pool_buffer) =
-                pool.get_buffer(status_readback_size, status_readback_usage)
+            if let Some(pool_buffer) = pool.get_buffer(status_readback_size, status_readback_usage)
             {
                 pool_buffer
             } else {
@@ -692,7 +728,13 @@ impl GPUDecompressor {
         })
     }
 
-    fn submit_dispatch(&self, total_blocks: usize, buffers: &DispatchBuffers) -> Result<()> {
+    async fn submit_dispatch(&self, total_blocks: usize, buffers: &DispatchBuffers) -> Result<()> {
+        // Capture validation and OOM failures instead of panicking, so callers can surface rich GPU errors.
+        self.device.device.push_error_scope(ErrorFilter::Validation);
+        self.device
+            .device
+            .push_error_scope(ErrorFilter::OutOfMemory);
+
         let bgl0 = self.device.compute_pipeline.get_bind_group_layout(0);
         let bind_group = self.device.device.create_bind_group(&BindGroupDescriptor {
             label: Some("LZ4 Bind Group"),
@@ -751,6 +793,24 @@ impl GPUDecompressor {
         let command_buffer = encoder.finish();
         self.device.queue.submit(std::iter::once(command_buffer));
         self.device.device.poll(Maintain::Wait);
+
+        // Pop error scopes in reverse order to propagate failures with adapter context.
+        if let Some(err) = self.device.device.pop_error_scope().await {
+            return Err(anyhow::anyhow!(
+                "GPU dispatch failed with out-of-memory on adapter {} (backend {:?}): {}",
+                self.device.adapter_info.name,
+                self.device.adapter_info.backend,
+                err
+            ));
+        }
+        if let Some(err) = self.device.device.pop_error_scope().await {
+            return Err(anyhow::anyhow!(
+                "GPU dispatch validation failed on adapter {} (backend {:?}): {}",
+                self.device.adapter_info.name,
+                self.device.adapter_info.backend,
+                err
+            ));
+        }
         Ok(())
     }
 
@@ -759,12 +819,12 @@ impl GPUDecompressor {
         frame: &LZ4CompressedFrame,
         buffers: &DispatchBuffers,
     ) -> Result<Option<anyhow::Error>> {
-        let mut status_encoder = self
-            .device
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("Status Readback Encoder"),
-            });
+        let mut status_encoder =
+            self.device
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("Status Readback Encoder"),
+                });
         status_encoder.copy_buffer_to_buffer(
             &buffers.status_buffer,
             0,
